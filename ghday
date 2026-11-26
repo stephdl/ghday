@@ -237,7 +237,11 @@ def analyse(data, me, since, now):
                       if r.get("author") and r["author"]["login"] == me and r.get("submittedAt")]
         c = pr["commits"]["nodes"]
         last_commit = ts(c[0]["commit"]["committedDate"]) if c else None
-        if my_reviews and last_commit and last_commit > max(my_reviews):
+        mine = sorted((r for r in pr["reviews"]["nodes"] if r.get("author") and r["author"]["login"] == me
+                       and r.get("submittedAt")), key=lambda r: r["submittedAt"])
+        # My approval still stands, so new commits do not need me again; a re-request lands in reviewReq.
+        still_ok = mine and mine[-1]["state"] == "APPROVED" and pr["reviewDecision"] == "APPROVED"
+        if my_reviews and last_commit and last_commit > max(my_reviews) and not still_ok:
             add("review", pr, f"new commits from {pr['author']['login']} since your review", last_commit)
 
     for iss in data["assigned"]["nodes"]:
