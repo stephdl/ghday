@@ -8,6 +8,7 @@ ghday build      build the page only
 import copy
 import html
 import json
+import re
 import statistics
 import subprocess
 import sys
@@ -36,6 +37,8 @@ fragment I on Issue {
   number title url createdAt updatedAt
   repository { nameWithOwner }
   labels(first: 6) { nodes { name color } }
+  issueType { name }
+  projectItems(first: 3) { nodes { fieldValueByName(name: "Status") { ... on ProjectV2ItemFieldSingleSelectValue { name } } } }
   milestone { title }
   comments(last: 15) { totalCount nodes { ...C } }
   timelineItems(itemTypes: [ASSIGNED_EVENT], last: 10) {
@@ -597,6 +600,10 @@ def render_waiting(prs, shown, total, now):
             f'<p class="hint">{len(waiting)} of your {total} open PRs, by who has to move next</p>{"".join(groups)}</section>')
 
 
+def slug(name):
+    return re.sub(r"[^a-z]+", "-", name.lower()).strip("-")
+
+
 def render_issues(issues, since, now):
     if not issues:
         return '<p class="calm">No issue assigned.</p>'
@@ -604,9 +611,21 @@ def render_issues(issues, since, now):
     def arrived(it):
         return it.get("_assigned") or ts(it["createdAt"])
 
+    def status(it):
+        for n in (it.get("projectItems") or {}).get("nodes", []):
+            if (n.get("fieldValueByName") or {}).get("name"):
+                return n["fieldValueByName"]["name"]
+        return None
+
     def row(it):
-        labs = "".join(f'<span class="lab" style="--c:#{e(l["color"])}">{e(l["name"])}</span>'
-                       for l in it["labels"]["nodes"][:2])
+        st = status(it)
+        kind = (it.get("issueType") or {}).get("name")
+        tags = (f'<span class="ty ty-{slug(kind)}">{e(kind)}</span>' if kind else "") + \
+               (f'<span class="st st-{slug(st)}">{e(st)}</span>' if st else "")
+        # The status already says "Testing", the label would repeat it.
+        keep = [l for l in it["labels"]["nodes"] if not st or l["name"].lower() != st.lower()][:2]
+        labs = "".join(f'<span class="lab" style="--c:#{e(l["color"])}">{e(l["name"])}</span>' for l in keep)
+        labs = tags + labs
         ms = f'<span class="ms">{e(it["milestone"]["title"])}</span>' if it.get("milestone") else ""
         stale = now - ts(it["updatedAt"]) > timedelta(days=STALE_DAYS)
         quiet = f'<span class="flag">quiet {ago(ts(it["updatedAt"]), now)}</span>' if stale else ""
@@ -811,6 +830,10 @@ li.new .t::before{content:"";display:inline-block;width:8px;height:8px;border-ra
 summary{cursor:pointer;padding:6px 0}
 .notes{margin-top:36px}
 .lab{font-size:12px;padding:0 7px;border-radius:999px;color:var(--ink);background:color-mix(in srgb,var(--c) 22%,transparent)}
+.ty,.st{font-size:12px;font-weight:600;padding:0 7px;border-radius:4px;--c:var(--mute);color:var(--c);background:color-mix(in srgb,var(--c) 14%,transparent)}
+.st{border-radius:999px;font-weight:500}
+.ty-bug{--c:var(--hot)}.ty-task{--c:var(--g-release)}.ty-feature{--c:var(--g-merge)}.ty-design{--c:var(--g-fix)}.ty-backend{--c:light-dark(#be185d,#f472b6)}.ty-frontend{--c:var(--g-testing)}
+.st-todo{--c:var(--g-fix)}.st-in-progress{--c:var(--g-review)}.st-testing{--c:var(--g-testing)}.st-verified{--c:var(--g-release)}.st-done{--c:var(--g-merge)}
 .ms{font-size:12px;padding:0 7px;border-radius:4px;border:1px solid var(--rule)}
 .finding{font-size:clamp(20px,2.4vw,26px);font-weight:700;letter-spacing:-.015em;line-height:1.25;margin:32px 0 0;max-width:40ch}
 .periods{display:grid;grid-template-columns:repeat(auto-fit,minmax(min(100%,440px),1fr));gap:24px 48px;margin-top:28px}
