@@ -867,6 +867,15 @@ td:first-child{white-space:nowrap}
 .hb i{display:block;height:10px;border-radius:2px;background:var(--acc)}
 .hb.rv i{background:var(--g-new)}
 .hb span{font-size:13px}
+.tr-r{display:flex;align-items:center;gap:20px;flex-wrap:wrap;justify-content:flex-end}
+.ctl{display:flex;align-items:center;gap:2px;background:var(--panel);border-radius:999px;padding:4px;font-size:14px}
+.ctl label{display:flex;align-items:center;gap:4px;padding-left:14px;color:var(--mute)}
+.ctl select,.ctl button{font:inherit;font-weight:600;color:var(--ink);border:0;cursor:pointer;border-radius:999px}
+.ctl select{background:none;padding:8px 6px}
+.ctl button{background:var(--bg);padding:8px 16px;box-shadow:0 1px 2px rgb(0 0 0/.12)}
+.ctl button:disabled{color:var(--mute);cursor:wait}
+.tr-r .ctl+nav{position:relative;margin-left:1px}
+.tr-r .ctl+nav::before{content:"";position:absolute;left:-11px;top:20%;bottom:20%;border-left:1px solid var(--rule)}
 footer{margin-top:56px;padding-top:14px;border-top:1px solid var(--rule);font-size:13px;color:var(--mute)}
 code{font-size:13px}
 .daily{margin-top:28px}
@@ -939,8 +948,10 @@ const cp=document.getElementById('copy');
 if(cp)cp.onclick=async()=>{const t=document.getElementById('dtext').value;try{await navigator.clipboard.writeText(t);cp.textContent='Copied'}catch(_){const a=document.getElementById('dtext');a.hidden=false;a.select();document.execCommand('copy');a.hidden=true;cp.textContent='Copied'}setTimeout(()=>cp.textContent='Copy text',2000)};
 const post=(u,b)=>fetch(u,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(b||{})}).then(()=>location.reload());
 document.querySelectorAll('.act button').forEach(b=>b.onclick=ev=>{ev.preventDefault();const a=b.parentElement;a.closest('li').style.opacity=.3;post('/hide',{k:a.dataset.k,w:a.dataset.w,m:b.dataset.m})});
+const ev=document.getElementById('every');if(ev)ev.onchange=()=>post('/refresh-every',{s:+ev.value});
+const nw=document.getElementById('now');if(nw)nw.onclick=()=>{nw.disabled=true;nw.textContent='Refreshing…';post('/refresh-now')};
 const uh=document.getElementById('unhide');if(uh)uh.onclick=()=>post('/unhide-all');
-if(document.body.dataset.live==='1'){const t0=Date.now();const tick=()=>{if(document.visibilityState==='visible'&&Date.now()-t0>300000&&!document.querySelector('details[open]'))location.reload()};setInterval(tick,30000);document.addEventListener('visibilitychange',tick)}}
+if(document.body.dataset.live==='1'){const t0=Date.now();const tick=()=>{if(document.visibilityState==='visible'&&Date.now()-t0>document.body.dataset.every*1000&&!document.querySelector('details[open]'))location.reload()};setInterval(tick,30000);document.addEventListener('visibilitychange',tick)}}
 """
 
 
@@ -971,6 +982,23 @@ query($merged: String!, $opened: String!, $reviewed: String!) {
 """
 EN_DAYS = ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday"]
 REFRESH = 300
+REFRESH_CHOICES = (60, 300, 600, 900, 1800, 3600)
+REFRESH_FILE = STATE.with_name("refresh.json")
+
+
+def load_refresh():
+    try:
+        v = int(json.loads(REFRESH_FILE.read_text()))
+    except (OSError, ValueError, TypeError):
+        return REFRESH
+    return v if v in REFRESH_CHOICES else REFRESH
+
+
+def refresh_select(every):
+    opts = "".join(f'<option value="{v}"{" selected" if v == every else ""}>{v // 60} min</option>'
+                   for v in REFRESH_CHOICES)
+    return (f'<div class="ctl"><label>Refresh every <select id="every">{opts}</select></label>'
+            f'<button id="now" type="button">Refresh now</button></div>')
 
 
 def previous_workday(local):
@@ -1085,7 +1113,7 @@ def render_daily(dt):
             f'<textarea id="dtext" readonly hidden>{e(dt["text"])}</textarea></div>')
 
 
-def render(f, since, live=False):
+def render(f, since, live=False, every=REFRESH):
     now = datetime.now(timezone.utc)
     data = copy.deepcopy(f["data"])
     notes, st = f["notes"], f["stats"]
@@ -1107,15 +1135,15 @@ def render(f, since, live=False):
     mine = data["mine"]["nodes"]
     waiting = sum(1 for pr in mine if pr["url"] not in my_move(groups))
     fetched = f["at"].astimezone()
-    foot = (f"Data from {fetched:%H:%M}, refreshed every {REFRESH // 60} min. The page reloads by itself."
+    foot = (f"Data from {fetched:%H:%M}, refreshed every {every // 60} min. The page reloads by itself."
             if live else f"Data from {fetched:%H:%M}. Run <code>ghday</code> again to refresh.")
 
     return f"""<!doctype html><html lang="en"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1"><title>GitHub day</title>
 <link rel="preconnect" href="https://fonts.googleapis.com"><link href="https://fonts.googleapis.com/css2?family=Libre+Franklin:wght@400;500;600;700;800&display=swap" rel="stylesheet">
-<style>{CSS}</style></head><body data-live="{1 if live else 0}"><div class="wrap">
+<style>{CSS}</style></head><body data-live="{1 if live else 0}" data-every="{every}"><div class="wrap">
 <div class="top"><div><h1>{DAYS[local.weekday()]}, {MONTHS[local.month - 1]} {local.day}</h1><p class="lede">{lede}</p></div>
-<nav><button data-v="jour" aria-pressed="true">Today</button><button data-v="daily" aria-pressed="false">Daily</button><button data-v="stats" aria-pressed="false">Stats</button></nav></div>
+<div class="tr-r">{refresh_select(every) if live else ""}<nav><button data-v="jour" aria-pressed="true">Today</button><button data-v="daily" aria-pressed="false">Daily</button><button data-v="stats" aria-pressed="false">Stats</button></nav></div></div>
 <main data-view="jour">
 {render_strip(groups)}
 <div class="board"><div class="main-col">
@@ -1213,8 +1241,9 @@ def notify_new(f):
 
 
 def serve(port):
-    cache = {"f": None, "err": None}
+    cache = {"f": None, "err": None, "every": load_refresh()}
     lock = threading.Lock()
+    wake = threading.Event()
 
     def refresh():
         try:
@@ -1228,7 +1257,10 @@ def serve(port):
 
     def loop():
         while True:
-            time.sleep(REFRESH)
+            # A new interval wakes the loop so it applies now, not after the old delay.
+            if wake.wait(cache["every"]):
+                wake.clear()
+                continue
             refresh()
 
     class H(BaseHTTPRequestHandler):
@@ -1244,7 +1276,7 @@ def serve(port):
             if f is None:
                 body, code = f"<pre>ghday: {e(cache['err'] or 'no data')}</pre>".encode(), 500
             else:
-                body, code = render(f, visit_threshold(datetime.now(timezone.utc)), live=True).encode(), 200
+                body, code = render(f, visit_threshold(datetime.now(timezone.utc)), live=True, every=cache["every"]).encode(), 200
             self.send_response(code)
             self.send_header("Content-Type", "text/html; charset=utf-8")
             self.send_header("Cache-Control", "no-store")
@@ -1257,6 +1289,14 @@ def serve(port):
                 body = json.loads(self.rfile.read(n) or b"{}")
                 if self.path == "/hide" and body.get("m") in ("hide", "snooze") and body.get("k"):
                     hide_item(str(body["k"]), body.get("w") or None, body["m"])
+                elif self.path == "/refresh-every" and body.get("s") in REFRESH_CHOICES:
+                    cache["every"] = body["s"]
+                    REFRESH_FILE.parent.mkdir(parents=True, exist_ok=True)
+                    REFRESH_FILE.write_text(json.dumps(body["s"]))
+                    wake.set()
+                elif self.path == "/refresh-now":
+                    refresh()
+                    wake.set()
                 elif self.path == "/unhide-all":
                     with HIDE_LOCK:
                         save_hidden({})
