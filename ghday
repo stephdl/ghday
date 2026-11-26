@@ -888,6 +888,7 @@ code{font-size:13px}
 .dblock h3{margin:0 0 8px;font-size:18px}
 .dblock li{padding:8px 0;border-bottom:1px solid var(--rule);line-height:1.4}
 .dblock li.none{color:var(--mute)}
+.dblock li a{color:var(--acc);text-decoration:none}.dblock li a:hover{text-decoration:underline}
 .qa{margin-top:14px;padding-top:10px;border-top:1px dashed color-mix(in srgb,var(--c) 50%,var(--rule))}
 .qa h4{margin:0 0 2px;font-size:13px;font-weight:600;color:var(--mute)}
 .qa h4 span{color:var(--ink)}
@@ -1092,18 +1093,30 @@ def daily_text(f, groups, now):
     if data["_testing"]:
         blk.append(f"{len(data['_testing'])} issues in QA testing: " + ", ".join(f"dev#{i['number']}" for i in data["_testing"]))
 
+    linked = d["merged"] + d["opened"] + d["reviewed"] + data["qa"]["nodes"] + waiting + data["_testing"] + \
+        [x["item"] for v in groups.values() for x in v]
+    links = {pr_ref(x): x["url"] for x in linked if x.get("url")}
+
     def section(title, lines, empty):
         return title + "\n" + ("\n".join(f"- {l}" for l in lines) if lines else f"- {empty}")
 
-    return {"title_y": f"{label} ({EN_DAYS[start.weekday()]} {start.day})", "y": y, "t": t, "b": blk,
+    return {"title_y": f"{label} ({EN_DAYS[start.weekday()]} {start.day})", "y": y, "t": t, "b": blk, "links": links,
             "text": "\n\n".join([section(f"{label}:", y, "nothing recorded on GitHub"),
                                  section("Today:", t, "continue current issues"),
                                  section("Blockers:", blk, "none")])}
 
 
 def render_daily(dt):
+    links = dt.get("links") or {}
+    # Longest first so ns8-core#13 never matches inside ns8-core#1325.
+    pat = re.compile(r"(?<![\w/-])(" + "|".join(re.escape(k) for k in sorted(links, key=len, reverse=True)) + r")(?!\d)") if links else None
+
+    def linkify(line):
+        line = e(line)
+        return pat.sub(lambda m: f'<a href="{e(links[m.group(1)])}">{m.group(1)}</a>', line) if pat else line
+
     def block(title, lines, empty):
-        lis = "".join(f"<li>{e(l)}</li>" for l in lines) or f'<li class="none">{empty}</li>'
+        lis = "".join(f"<li>{linkify(l)}</li>" for l in lines) or f'<li class="none">{empty}</li>'
         return f'<section class="dblock"><h3>{title}</h3><ul>{lis}</ul></section>'
     return (f'<div class="daily"><div class="dhead"><p class="h2note">Ready to paste in the daily channel. '
             f'"{e(dt["title_y"])}" covers the last working day.</p>'
