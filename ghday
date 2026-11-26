@@ -512,6 +512,9 @@ def render_strip(groups):
 def render_groups(groups, now, live=False, hidden=0, tail=""):
     cards = []
     for key, name, hint in GROUPS:
+        if key == "new" and tail:
+            cards.append(tail)
+            tail = ""
         items = groups[key]
         if not items:
             continue
@@ -749,7 +752,7 @@ CSS = """
    COLOUR white or near-black ground, ink, teal lead, claret for urgent, one colour per action
    TYPE Libre Franklin 800 + Libre Franklin
    LAYOUT laptop: strip across, action cards in a grid, pipeline full width; phone: everything stacks */
-:root{color-scheme:light dark;--bg:light-dark(#ffffff,#121417);--ink:light-dark(#17191c,#e9eaec);--mute:light-dark(#5f646b,#9ba1a8);--rule:light-dark(#e4e6e9,#262a2f);--panel:light-dark(#f5f6f7,#1a1d21);--acc:light-dark(#0d7680,#4cb5be);--hot:light-dark(#b0123e,#ff6d8c);--g-review:light-dark(#0e7490,#22d3ee);--g-reply:light-dark(#be123c,#fb7185);--g-fix:light-dark(#c2410c,#fb923c);--g-merge:light-dark(#15803d,#4ade80);--g-new:light-dark(#6d28d9,#a78bfa);--g-release:light-dark(#a16207,#facc15);--g-testing:light-dark(#1d4ed8,#60a5fa)}
+:root{color-scheme:light dark;--bg:light-dark(#ffffff,#121417);--ink:light-dark(#17191c,#e9eaec);--mute:light-dark(#5f646b,#9ba1a8);--rule:light-dark(#e4e6e9,#262a2f);--panel:light-dark(#f5f6f7,#1a1d21);--acc:light-dark(#0d7680,#4cb5be);--hot:light-dark(#b0123e,#ff6d8c);--g-review:light-dark(#0e7490,#22d3ee);--g-reply:light-dark(#be123c,#fb7185);--g-fix:light-dark(#c2410c,#fb923c);--g-merge:light-dark(#15803d,#4ade80);--g-new:light-dark(#6d28d9,#a78bfa);--g-release:light-dark(#a16207,#facc15);--g-testing:light-dark(#1d4ed8,#60a5fa);--g-wait:light-dark(#a21caf,#e879f9)}
 *{box-sizing:border-box;min-width:0}
 body{margin:0;background:var(--bg);color:var(--ink);font:15px/1.5 "Libre Franklin",system-ui,sans-serif;overflow-x:clip}
 a{color:inherit;text-decoration:none}
@@ -873,7 +876,7 @@ code{font-size:13px}
 .tiles.react{grid-template-columns:repeat(4,minmax(0,1fr));max-width:900px}
 @media(max-width:640px){.tiles.react{grid-template-columns:repeat(2,minmax(0,1fr))}}
 .rows li.stale{opacity:.6}
-.g-wait{--c:var(--mute)}
+.g-wait{--c:var(--g-wait)}
 .wg{border-bottom:1px solid var(--rule)}
 .wg summary{display:flex;justify-content:space-between;gap:8px;padding:9px 0;cursor:pointer;list-style:none}
 .wg summary::-webkit-details-marker{display:none}
