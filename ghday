@@ -560,6 +560,11 @@ def blocker(pr, now):
     return f'<span class="who bad">no reviewer requested, opened {ago(ts(pr["createdAt"]), now)} ago</span>'
 
 
+def my_move(groups):
+    """PRs where the next step is mine. A CI failure or a conflict does not stop the reviewer."""
+    return {x["item"]["url"] for g in ("reply", "merge") for x in groups.get(g, [])}
+
+
 def render_waiting(prs, shown, total, now):
     """Open PRs with no action for me, grouped by who has to move next."""
     waiting = [p for p in prs if p["url"] not in shown]
@@ -1025,7 +1030,7 @@ def daily_text(f, groups, now):
         t.append(f"Start dev#{g['item']['number']}: {g['item']['title']}")
 
     shown = {x["item"]["url"] for v in groups.values() for x in v}
-    waiting = [p for p in data["mine"]["nodes"] if p["url"] not in shown and not p["isDraft"]]
+    waiting = [p for p in data["mine"]["nodes"] if p["url"] not in my_move(groups) and not p["isDraft"]]
     blk = []
     if waiting:
         oldest = min(waiting, key=lambda p: ts(p["createdAt"]))
@@ -1074,7 +1079,7 @@ def render(f, since, live=False):
     lede += f". Last visit {ago(since, now)} ago."
     shown = {t["item"]["url"] for v in groups.values() for t in v}
     mine = data["mine"]["nodes"]
-    waiting = sum(1 for pr in mine if pr["url"] not in shown)
+    waiting = sum(1 for pr in mine if pr["url"] not in my_move(groups))
     fetched = f["at"].astimezone()
     foot = (f"Data from {fetched:%H:%M}, refreshed every {REFRESH // 60} min. The page reloads by itself."
             if live else f"Data from {fetched:%H:%M}. Run <code>ghday</code> again to refresh.")
@@ -1088,7 +1093,7 @@ def render(f, since, live=False):
 <main data-view="jour">
 {render_strip(groups)}
 <div class="board"><div class="main-col">
-{render_groups(groups, now, live, hidden, render_waiting(mine, shown, data["mine"]["issueCount"], now))}
+{render_groups(groups, now, live, hidden, render_waiting(mine, my_move(groups), data["mine"]["issueCount"], now))}
 </div><aside class="side-col">
 <h2>My issues</h2><p class="h2note">{data["assigned"]["issueCount"]} assigned, newest first.</p>
 {render_issues(data["assigned"]["nodes"], since, now)}
