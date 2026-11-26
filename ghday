@@ -752,7 +752,7 @@ CSS = """
    COLOUR white or near-black ground, ink, teal lead, claret for urgent, one colour per action
    TYPE Libre Franklin 800 + Libre Franklin
    LAYOUT laptop: strip across, action cards in a grid, pipeline full width; phone: everything stacks */
-:root{color-scheme:light dark;--bg:light-dark(#ffffff,#121417);--ink:light-dark(#17191c,#e9eaec);--mute:light-dark(#5f646b,#9ba1a8);--rule:light-dark(#e4e6e9,#262a2f);--panel:light-dark(#f5f6f7,#1a1d21);--acc:light-dark(#0d7680,#4cb5be);--hot:light-dark(#b0123e,#ff6d8c);--g-review:light-dark(#0e7490,#22d3ee);--g-reply:light-dark(#be123c,#fb7185);--g-fix:light-dark(#c2410c,#fb923c);--g-merge:light-dark(#15803d,#4ade80);--g-new:light-dark(#6d28d9,#a78bfa);--g-release:light-dark(#a16207,#facc15);--g-testing:light-dark(#1d4ed8,#60a5fa);--g-wait:light-dark(#a21caf,#e879f9)}
+:root{color-scheme:light dark;--bg:light-dark(#ffffff,#121417);--ink:light-dark(#17191c,#e9eaec);--mute:light-dark(#5f646b,#9ba1a8);--rule:light-dark(#e4e6e9,#262a2f);--panel:light-dark(#f5f6f7,#1a1d21);--acc:light-dark(#0d7680,#4cb5be);--hot:light-dark(#b0123e,#ff6d8c);--g-review:light-dark(#0e7490,#22d3ee);--g-reply:light-dark(#be123c,#fb7185);--g-fix:light-dark(#c2410c,#fb923c);--g-merge:light-dark(#15803d,#4ade80);--g-new:light-dark(#6d28d9,#a78bfa);--g-release:light-dark(#a16207,#facc15);--g-testing:light-dark(#1d4ed8,#60a5fa);--g-wait:light-dark(#52667a,#9fb3c8)}
 *{box-sizing:border-box;min-width:0}
 body{margin:0;background:var(--bg);color:var(--ink);font:15px/1.5 "Libre Franklin",system-ui,sans-serif;overflow-x:clip}
 a{color:inherit;text-decoration:none}
