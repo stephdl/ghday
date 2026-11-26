@@ -1,0 +1,1259 @@
+#!/usr/bin/python3
+"""Daily GitHub dashboard built from the gh CLI.
+
+ghday            build the page and open it in the browser
+ghday serve [P]  serve it on 127.0.0.1:P (default 8765), rebuilt on each reload
+ghday build      build the page only
+"""
+import copy
+import html
+import json
+import statistics
+import subprocess
+import sys
+import threading
+import time
+import webbrowser
+from concurrent.futures import ThreadPoolExecutor
+from collections import Counter, defaultdict
+from datetime import datetime, timedelta, timezone
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from pathlib import Path
+
+STATE = Path.home() / ".local/state/ghday/state.json"
+STATS_CACHE = STATE.with_name("stats.json")
+STATS_TTL = timedelta(hours=1)
+OUT = Path.home() / ".local/share/ghday/index.html"
+STALE_DAYS = 30
+# Issues leave my assignee list once they go to QA, but a verified one still needs my release.
+QA_REPO = "NethServer/dev"
+QA_LABELS = ("testing", "verified")
+WEEKS = 12
+
+FRAGMENTS = """
+fragment C on IssueComment { author { login __typename } createdAt url }
+fragment I on Issue {
+  number title url createdAt updatedAt
+  repository { nameWithOwner }
+  labels(first: 6) { nodes { name color } }
+  milestone { title }
+  comments(last: 15) { totalCount nodes { ...C } }
+  timelineItems(itemTypes: [ASSIGNED_EVENT], last: 10) {
+    nodes { ... on AssignedEvent { createdAt assignee { ... on User { login } } } }
+  }
+}
+fragment P on PullRequest {
+  number title url isDraft createdAt updatedAt mergeable reviewDecision
+  repository { nameWithOwner }
+  author { login }
+  labels(first: 6) { nodes { name color } }
+  comments(last: 15) { totalCount nodes { ...C } }
+  reviews(last: 30) { nodes { author { login __typename } state submittedAt url } }
+  commits(last: 1) { nodes { commit { committedDate statusCheckRollup { state } } } }
+  reviewRequests(first: 6) { nodes { requestedReviewer { ... on User { login } ... on Team { name } } } }
+  timelineItems(itemTypes: [REVIEW_REQUESTED_EVENT], last: 10) {
+    nodes { ... on ReviewRequestedEvent { createdAt requestedReviewer { ... on User { login } ... on Team { name } } } }
+  }
+}
+"""
+
+FRAGMENTS += """
+fragment S on Issue {
+  number title url updatedAt
+  repository { nameWithOwner }
+  assignees(first: 3) { nodes { login } }
+}
+fragment Q on Issue {
+  number title url updatedAt
+  repository { nameWithOwner }
+  labels(first: 10) { nodes { name color } }
+  assignees(first: 5) { nodes { login } }
+  timelineItems(itemTypes: [ASSIGNED_EVENT, UNASSIGNED_EVENT, LABELED_EVENT, CROSS_REFERENCED_EVENT], last: 80) {
+    nodes {
+      __typename
+      ... on AssignedEvent { assignee { ... on User { login } } }
+      ... on UnassignedEvent { assignee { ... on User { login } } }
+      ... on LabeledEvent { createdAt actor { login } label { name } }
+      ... on CrossReferencedEvent { source { ... on PullRequest { author { login } merged repository { nameWithOwner } } } }
+    }
+  }
+}
+"""
+
+NOW_QUERY = FRAGMENTS + """
+query {
+  viewer { login }
+  assigned: search(type: ISSUE, first: 60, query: "is:open is:issue assignee:@me archived:false sort:updated-desc") { issueCount nodes { ...I } }
+  reviewReq: search(type: ISSUE, first: 40, query: "is:open is:pr review-requested:@me archived:false sort:updated-desc") { issueCount nodes { ...P } }
+  mine: search(type: ISSUE, first: 60, query: "is:open is:pr author:@me archived:false sort:updated-desc") { issueCount nodes { ...P } }
+  reviewed: search(type: ISSUE, first: 40, query: "is:open is:pr reviewed-by:@me -author:@me archived:false sort:updated-desc") { nodes { ...P } }
+  qa: search(type: ISSUE, first: 100, query: "repo:%s is:open is:issue label:%s") { nodes { ...Q } }
+  created: search(type: ISSUE, first: 100, query: "is:open is:issue author:@me archived:false sort:updated-desc") { nodes { ...S } }
+  mentioned: search(type: ISSUE, first: 50, query: "is:open is:issue mentions:@me archived:false sort:updated-desc") { nodes { ...S } }
+}""" % (QA_REPO, ",".join(QA_LABELS)) + """
+"""
+
+SEARCH_PAGE = """
+query($q: String!, $after: String) {
+  search(type: ISSUE, first: 100, query: $q, after: $after) {
+    issueCount
+    pageInfo { hasNextPage endCursor }
+    nodes {
+      ... on PullRequest { createdAt mergedAt repository { nameWithOwner } }
+      ... on Issue { createdAt closedAt repository { nameWithOwner } }
+    }
+  }
+}
+"""
+
+
+def gh(args, inp=None):
+    r = subprocess.run(["gh", *args], capture_output=True, text=True, input=inp)
+    if r.returncode != 0:
+        raise RuntimeError(r.stderr.strip() or "gh failed")
+    return json.loads(r.stdout)
+
+
+def graphql(query, **vars):
+    args = ["api", "graphql", "-f", f"query={query}"]
+    for k, v in vars.items():
+        if v is not None:
+            args += ["-f", f"{k}={v}"]
+    out = gh(args)
+    if out.get("errors") and not out.get("data"):
+        raise RuntimeError(out["errors"][0].get("message"))
+    return out["data"]
+
+
+def search_all(q):
+    nodes, after = [], None
+    while True:
+        s = graphql(SEARCH_PAGE, q=q, after=after)["search"]
+        nodes += [n for n in s["nodes"] if n]
+        if not s["pageInfo"]["hasNextPage"] or len(nodes) >= 1000:
+            return nodes
+        after = s["pageInfo"]["endCursor"]
+
+
+def ts(s):
+    return datetime.fromisoformat(s.replace("Z", "+00:00")) if s else None
+
+
+def iso(d):
+    return d.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def ago(d, now):
+    if not d:
+        return ""
+    s = (now - d).total_seconds()
+    if s < 3600:
+        return f"{max(1, int(s // 60))} min"
+    if s < 86400:
+        return f"{int(s // 3600)} h"
+    days = int(s // 86400)
+    return f"{days} d" if days < 60 else f"{days // 30} mo"
+
+
+def visit_threshold(now):
+    # Reloads within 30 minutes count as the same visit, so "new" marks survive a refresh.
+    try:
+        st = json.loads(STATE.read_text())
+    except (OSError, ValueError):
+        st = {}
+    last = ts(st.get("last"))
+    prev = ts(st.get("prev")) or now - timedelta(days=1)
+    if not last or now - last > timedelta(minutes=30):
+        prev = last or prev
+        st = {"prev": iso(prev), "last": iso(now)}
+        STATE.parent.mkdir(parents=True, exist_ok=True)
+        STATE.write_text(json.dumps(st))
+    return prev
+
+
+def human(node):
+    a = node.get("author") or {}
+    return a.get("__typename") != "Bot" and not (a.get("login") or "").endswith("[bot]")
+
+
+def other_activity(item, me):
+    """Latest comment or review by a human other than me, and my own latest activity."""
+    evts = [(ts(c["createdAt"]), c["author"]["login"], c["url"], "comment")
+            for c in item["comments"]["nodes"] if c.get("author") and human(c)]
+    for r in (item.get("reviews") or {}).get("nodes", []):
+        # An approval asks nothing back, so it never counts as waiting for my answer.
+        if r.get("author") and r.get("submittedAt") and human(r) and r.get("state") != "APPROVED":
+            evts.append((ts(r["submittedAt"]), r["author"]["login"], r["url"], "review"))
+    mine = [e[0] for e in evts if e[1] == me]
+    if item.get("author", {}).get("login") == me:
+        c = item["commits"]["nodes"]
+        if c:
+            mine.append(ts(c[0]["commit"]["committedDate"]))
+    others = sorted((e for e in evts if e[1] != me), key=lambda e: e[0])
+    return (others[-1] if others else None), (max(mine) if mine else None)
+
+
+def ci_state(pr):
+    c = pr["commits"]["nodes"]
+    roll = c[0]["commit"]["statusCheckRollup"] if c else None
+    return roll["state"] if roll else None
+
+
+def analyse(data, me, since, now):
+    todo = []
+
+    def add(group, item, reason, when):
+        todo.append({"group": group, "item": item, "reason": reason,
+                     "when": when, "new": bool(when and when > since)})
+
+    for pr in data["reviewReq"]["nodes"]:
+        req = [ts(e["createdAt"]) for e in pr["timelineItems"]["nodes"] if e]
+        when = max(req) if req else ts(pr["updatedAt"])
+        pr["_req"] = when
+        add("review", pr, f"requested by {pr['author']['login']}", when)
+
+    for pr in data["mine"]["nodes"]:
+        other, mine_t = other_activity(pr, me)
+        ci = ci_state(pr)
+        pr["_ci"], pr["_other"] = ci, other
+        if pr["reviewDecision"] == "CHANGES_REQUESTED":
+            add("reply", pr, "changes requested", ts(pr["updatedAt"]))
+        elif other and (not mine_t or other[0] > mine_t):
+            add("reply", pr, f"{other[3]} from {other[1]}", other[0])
+        if ci in ("FAILURE", "ERROR"):
+            add("fix", pr, "CI failing", ts(pr["commits"]["nodes"][0]["commit"]["committedDate"]))
+        if pr["mergeable"] == "CONFLICTING":
+            add("fix", pr, "merge conflict", ts(pr["updatedAt"]))
+        answered = not (other and (not mine_t or other[0] > mine_t))
+        if (answered and pr["reviewDecision"] == "APPROVED" and not pr["isDraft"]
+                and ci in (None, "SUCCESS") and pr["mergeable"] != "CONFLICTING"):
+            add("merge", pr, "approved, CI green", ts(pr["updatedAt"]))
+
+    for pr in data["reviewed"]["nodes"]:
+        my_reviews = [ts(r["submittedAt"]) for r in pr["reviews"]["nodes"]
+                      if r.get("author") and r["author"]["login"] == me and r.get("submittedAt")]
+        c = pr["commits"]["nodes"]
+        last_commit = ts(c[0]["commit"]["committedDate"]) if c else None
+        if my_reviews and last_commit and last_commit > max(my_reviews):
+            add("review", pr, f"new commits from {pr['author']['login']} since your review", last_commit)
+
+    for iss in data["assigned"]["nodes"]:
+        evts = [ts(e["createdAt"]) for e in iss["timelineItems"]["nodes"]
+                if e and (e.get("assignee") or {}).get("login") == me]
+        iss["_assigned"] = max(evts) if evts else None
+        other, mine_t = other_activity(iss, me)
+        iss["_other"] = other
+        if iss["_assigned"] and now - iss["_assigned"] < timedelta(days=3):
+            add("new", iss, "assigned to you", iss["_assigned"])
+        if other and mine_t and other[0] > mine_t:
+            add("reply", iss, f"{other[1]} commented after you", other[0])
+
+    data["_testing"] = []
+    for iss in data["qa"]["nodes"]:
+        tl = iss["timelineItems"]["nodes"]
+        was = any(e["__typename"] in ("AssignedEvent", "UnassignedEvent")
+                  and (e.get("assignee") or {}).get("login") == me for e in tl)
+        my_pr = any(e["__typename"] == "CrossReferencedEvent"
+                    and ((e.get("source") or {}).get("author") or {}).get("login") == me for e in tl)
+        if not (was or my_pr):
+            continue
+        names = {l["name"] for l in iss["labels"]["nodes"]}
+        state = "verified" if "verified" in names else "testing"
+        ev = [e for e in tl if e["__typename"] == "LabeledEvent" and e["label"]["name"] == state]
+        iss["_since"] = ts(ev[-1]["createdAt"]) if ev else ts(iss["updatedAt"])
+        iss["_by"] = ((ev[-1].get("actor") or {}).get("login") if ev else None)
+        repos = sorted({short_repo(e["source"]["repository"]["nameWithOwner"]) for e in tl
+                        if e["__typename"] == "CrossReferencedEvent" and e.get("source", {}).get("merged")
+                        and (e["source"].get("author") or {}).get("login") == me})
+        if state == "verified":
+            why = f"verified by {iss['_by']}" if iss["_by"] else "verified"
+            add("release", iss, why + (f", release {', '.join(repos)}" if repos else ""), iss["_since"])
+        else:
+            data["_testing"].append(iss)
+            who = ", ".join(a["login"] for a in iss["assignees"]["nodes"]) or "nobody"
+            add("testing", iss, f"tested by {who}", iss["_since"])
+
+    for iss in data["created"]["nodes"]:
+        if iss["repository"]["nameWithOwner"] == QA_REPO and not iss["assignees"]["nodes"]:
+            add("fix", iss, "nobody assigned, it will skip the QA flow", ts(iss["updatedAt"]))
+
+    todo.sort(key=lambda t: -(t["when"] or now).timestamp())
+    groups = {g[0]: [] for g in GROUPS}
+    seen = {}
+    for t in todo:
+        key = (t["group"], t["item"]["url"])
+        if key in seen:
+            seen[key]["reason"] += ", " + t["reason"]
+            seen[key]["new"] = seen[key]["new"] or t["new"]
+            continue
+        seen[key] = t
+        groups[t["group"]].append(t)
+    return groups
+
+
+def notifications():
+    try:
+        notes = gh(["api", "notifications?participating=true&per_page=50"])
+    except RuntimeError:
+        return []
+    out = []
+    for n in notes:
+        url = (n["subject"].get("url") or "").replace("api.github.com/repos", "github.com").replace("/pulls/", "/pull/")
+        out.append({"reason": n["reason"], "title": n["subject"]["title"],
+                    "repo": n["repository"]["full_name"], "url": url or n["repository"]["html_url"],
+                    "when": ts(n["updated_at"])})
+    return out
+
+
+DELIVERED_PAGE = """
+query($q: String!, $after: String) {
+  search(type: ISSUE, first: 50, query: $q, after: $after) {
+    pageInfo { hasNextPage endCursor }
+    nodes { ... on Issue { number closedAt
+      timelineItems(itemTypes: [ASSIGNED_EVENT, UNASSIGNED_EVENT, CROSS_REFERENCED_EVENT], last: 80) {
+        nodes {
+          __typename
+          ... on AssignedEvent { assignee { ... on User { login } } }
+          ... on UnassignedEvent { assignee { ... on User { login } } }
+          ... on CrossReferencedEvent { source { ... on PullRequest { author { login } repository { nameWithOwner } } } }
+        }
+      }
+    } }
+  }
+}
+"""
+
+
+def delivered(day, me):
+    """Closed QA issues I was assigned to at some point or referenced from one of my PRs."""
+    out, after = [], None
+    while True:
+        s = graphql(DELIVERED_PAGE, q=f"repo:{QA_REPO} is:issue is:closed reason:completed closed:>={day}", after=after)["search"]
+        for n in s["nodes"]:
+            tl = n["timelineItems"]["nodes"]
+            was = any(e["__typename"] in ("AssignedEvent", "UnassignedEvent")
+                      and (e.get("assignee") or {}).get("login") == me for e in tl)
+            repos = {e["source"]["repository"]["nameWithOwner"] for e in tl
+                     if e["__typename"] == "CrossReferencedEvent" and e.get("source", {}).get("repository")
+                     and (e["source"].get("author") or {}).get("login") == me}
+            if was or repos:
+                out.append({"closedAt": n["closedAt"], "repos": sorted(repos)})
+        if not s["pageInfo"]["hasNextPage"]:
+            return out
+        after = s["pageInfo"]["endCursor"]
+
+
+TURNAROUND_PAGE = """
+query($q: String!, $after: String, $me: String!) {
+  search(type: ISSUE, first: 50, query: $q, after: $after) {
+    pageInfo { hasNextPage endCursor }
+    nodes { ... on PullRequest {
+      timelineItems(itemTypes: [REVIEW_REQUESTED_EVENT], last: 20) {
+        nodes { ... on ReviewRequestedEvent { createdAt requestedReviewer { ... on User { login } } } }
+      }
+      reviews(author: $me, first: 50) { nodes { submittedAt } }
+    } }
+  }
+}
+"""
+
+
+def turnaround(day, me):
+    """Delay between each review request addressed to me and my first review after it."""
+    out, after = [], None
+    while True:
+        s = graphql(TURNAROUND_PAGE, q=f"is:pr reviewed-by:@me -author:@me updated:>={day}", after=after, me=me)["search"]
+        for pr in s["nodes"]:
+            mine = sorted(ts(r["submittedAt"]) for r in pr["reviews"]["nodes"] if r.get("submittedAt"))
+            for ev in pr["timelineItems"]["nodes"]:
+                if not ev or (ev.get("requestedReviewer") or {}).get("login") != me:
+                    continue
+                asked = ts(ev["createdAt"])
+                done = next((r for r in mine if r >= asked), None)
+                if done:
+                    out.append((done, (done - asked).total_seconds() / 3600))
+        if not s["pageInfo"]["hasNextPage"]:
+            return out
+        after = s["pageInfo"]["endCursor"]
+
+
+def stats(now):
+    local = now.astimezone()
+    week0 = (local - timedelta(days=local.weekday())).replace(hour=0, minute=0, second=0, microsecond=0)
+    month0 = local.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
+    pmonth0 = (month0 - timedelta(days=1)).replace(day=1)
+    start = min(week0 - timedelta(weeks=WEEKS - 1), pmonth0)
+    day = start.strftime("%Y-%m-%d")
+
+    me = graphql("query { viewer { login } }")["viewer"]["login"]
+    with ThreadPoolExecutor(3) as ex:
+        f_closed = ex.submit(delivered, day, me)
+        f_turn = ex.submit(turnaround, pmonth0.strftime("%Y-%m-%d"), me)
+        merged, opened = ex.map(search_all, [f"is:pr author:@me merged:>={day}", f"is:pr author:@me created:>={day}"])
+        closed = f_closed.result()
+        turn = f_turn.result()
+
+    weeks = [week0 - timedelta(weeks=i) for i in range(WEEKS - 1, -1, -1)]
+    ranges = {f"w{i}": (w, w + timedelta(weeks=1)) for i, w in enumerate(weeks)}
+    ranges["m0"] = (month0, local)
+    ranges["m1"] = (pmonth0, month0)
+    parts = []
+    for k, (a, b) in ranges.items():
+        extra = ("pullRequestReviewContributionsByRepository(maxRepositories: 15) "
+                 "{ repository { nameWithOwner } contributions { totalCount } }") if k == "m0" else ""
+        parts.append(f'{k}: contributionsCollection(from: "{iso(a)}", to: "{iso(b)}") '
+                     f"{{ totalPullRequestReviewContributions totalIssueContributions {extra} }}")
+    contrib = graphql("query { viewer { " + " ".join(parts) + " } }")["viewer"]
+
+    def count(nodes, field, a, b):
+        return sum(1 for n in nodes if n.get(field) and a <= ts(n[field]) < b)
+
+    series = []
+    for i, w in enumerate(weeks):
+        b = w + timedelta(weeks=1)
+        series.append({"week": w, "merged": count(merged, "mergedAt", w, b),
+                       "closed": count(closed, "closedAt", w, b),
+                       "reviews": contrib[f"w{i}"]["totalPullRequestReviewContributions"]})
+
+    def period(a, b, key):
+        return {"merged": count(merged, "mergedAt", a, b), "closed": count(closed, "closedAt", a, b),
+                "opened": count(opened, "createdAt", a, b),
+                "reviews": contrib[key]["totalPullRequestReviewContributions"] if key else None}
+
+    pweek = week0 - timedelta(weeks=1)
+    elapsed = local - week0
+    # Compare with the same number of days into last week, so Monday morning is not a "drop".
+    cur_w = period(week0, local, f"w{WEEKS - 1}")
+    prev_w = period(pweek, pweek + elapsed, None)
+    full_prev_w = period(pweek, week0, f"w{WEEKS - 2}")
+    m_elapsed = local - month0
+    cur_m = period(month0, local, "m0")
+    prev_m = period(pmonth0, min(pmonth0 + m_elapsed, month0), None)
+    full_prev_m = period(pmonth0, month0, "m1")
+
+    repos = defaultdict(lambda: Counter())
+    for n in merged:
+        if ts(n["mergedAt"]) >= month0:
+            repos[n["repository"]["nameWithOwner"]]["merged"] += 1
+    for n in closed:
+        if ts(n["closedAt"]) >= month0:
+            for r in n["repos"]:
+                repos[r]["closed"] += 1
+    for r in contrib["m0"]["pullRequestReviewContributionsByRepository"]:
+        repos[r["repository"]["nameWithOwner"]]["reviews"] += r["contributions"]["totalCount"]
+
+    lead = [(ts(n["mergedAt"]) - ts(n["createdAt"])).total_seconds() / 3600
+            for n in merged if ts(n["mergedAt"]) >= month0]
+    def med(a, b):
+        vals = [h for d, h in turn if a <= d < b]
+        return (statistics.median(vals), len(vals)) if vals else (None, 0)
+
+    react = {"w": med(week0, local), "pw": med(pweek, week0), "m": med(month0, local), "pm": med(pmonth0, month0)}
+    return {"react": react, "series": series, "cur_w": cur_w, "prev_w": prev_w, "full_prev_w": full_prev_w,
+            "cur_m": cur_m, "prev_m": prev_m, "full_prev_m": full_prev_m,
+            "repos": sorted(repos.items(), key=lambda kv: -sum(kv[1].values())),
+            "lead_median": statistics.median(lead) if lead else None,
+            "month_name": MONTHS[local.month - 1], "pmonth_name": MONTHS[pmonth0.month - 1]}
+
+
+MONTHS = ["January", "February", "March", "April", "May", "June", "July", "August",
+          "September", "October", "November", "December"]
+DAYS = ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday"]
+REASONS = {"mention": "Mention", "team_mention": "Team mention", "review_requested": "Review",
+           "assign": "Assigned", "comment": "Comment", "author": "Your thread",
+           "state_change": "State change", "ci_activity": "CI", "security_alert": "Security",
+           "manual": "Subscribed", "invitation": "Invitation"}
+
+e = html.escape
+
+GROUPS = [
+    ("release", "To release", "verified by QA, the package waits for your release"),
+    ("testing", "In testing", "QA is testing, they move to release once verified"),
+    ("review", "To review", "someone waits for your opinion"),
+    ("reply", "To answer", "someone wrote since your last action"),
+    ("fix", "To fix", "red CI, conflict, or issue with nobody assigned"),
+    ("merge", "To merge", "approved and CI green"),
+    ("new", "New issues", "assigned in the last 3 days"),
+]
+
+def short_repo(r):
+    return r.split("/", 1)[1] if r.startswith("NethServer/") else r
+
+
+def ref(item):
+    return f'<span class="ref">{e(short_repo(item["repository"]["nameWithOwner"]))}<i>#{item["number"]}</i></span>'
+
+
+def flags(pr):
+    out = []
+    ci = pr.get("_ci") or ci_state(pr)
+    if ci in ("FAILURE", "ERROR"):
+        out.append('<span class="flag bad">CI rouge</span>')
+    elif ci == "PENDING":
+        out.append('<span class="flag">CI en cours</span>')
+    if pr.get("mergeable") == "CONFLICTING":
+        out.append('<span class="flag bad">conflit</span>')
+    return "".join(out)
+
+
+def render_strip(groups):
+    cells = []
+    for key, name, _ in GROUPS:
+        n = len(groups[key])
+        fresh = sum(1 for t in groups[key] if t["new"])
+        sub = f'{fresh} new' if fresh else ("none" if not n else "&nbsp;")
+        tag = "a" if n else "div"
+        href = f' href="#g-{key}"' if n else ""
+        cells.append(f'<{tag} class="cell g-{key}{" zero" if not n else ""}"{href}>'
+                     f'<b>{n}</b><span>{name}</span><small>{sub}</small></{tag}>')
+    return '<div class="strip">' + "".join(cells) + "</div>"
+
+
+def render_groups(groups, now, live=False, hidden=0, tail=""):
+    cards = []
+    for key, name, hint in GROUPS:
+        items = groups[key]
+        if not items:
+            continue
+        lis = "".join(
+            f'<li{" class=new" if t["new"] else ""}><a class="t" href="{e(t["item"]["url"])}">{e(t["item"]["title"])}</a>'
+            f'<div class="m">{ref(t["item"])}<span class="why">{e(t["reason"])}</span>'
+            f'<span class="age">{ago(t["when"], now)}</span></div>'
+            + (f'<div class="act" data-k="{e(key + "|" + t["item"]["url"])}" data-w="{iso(t["when"]) if t["when"] else ""}">'
+               f'<button type="button" data-m="snooze">Tomorrow</button><button type="button" data-m="hide">Hide</button></div>'
+               if live else "") + '</li>' for t in items)
+        cards.append(f'<section class="card g-{key}" id="g-{key}"><header><h3>{name}</h3>'
+                     f'<span class="n">{len(items)}</span></header><p class="hint">{hint}</p>'
+                     f'<ul>{lis}</ul></section>')
+    more = (f'<p class="hidden-note">{hidden} item{"s" if hidden > 1 else ""} hidden or snoozed. '
+            f'{"They come" if hidden > 1 else "It comes"} back as soon as something new happens. <button type="button" id="unhide">Show all</button></p>'
+            if hidden and live else "")
+    if tail:
+        cards.append(tail)
+    if not cards:
+        return '<p class="calm">Nothing waits for you. Good time to push a long-running issue.</p>' + more
+    return '<div class="cards">' + "".join(cards) + "</div>" + more
+
+
+def reviewers(pr):
+    out = []
+    for n in (pr.get("reviewRequests") or {}).get("nodes", []):
+        r = n.get("requestedReviewer") or {}
+        if r.get("login") or r.get("name"):
+            out.append(r.get("login") or r.get("name"))
+    return out
+
+
+def waiting_since(pr):
+    req = [ts(e["createdAt"]) for e in pr["timelineItems"]["nodes"] if e]
+    return max(req) if req else ts(pr["createdAt"])
+
+
+def blocker(pr, now):
+    if pr["isDraft"]:
+        return ""
+    who = reviewers(pr)
+    if who:
+        return f'<span class="who">waiting for {e(", ".join(who))} for {ago(waiting_since(pr), now)}</span>'
+    if pr["reviews"]["nodes"]:
+        return '<span class="who">reviewed, no decision</span>'
+    return f'<span class="who bad">no reviewer requested, opened {ago(ts(pr["createdAt"]), now)} ago</span>'
+
+
+def render_waiting(prs, shown, total, now):
+    """Open PRs with no action for me, grouped by who has to move next."""
+    waiting = [p for p in prs if p["url"] not in shown]
+    if not waiting:
+        return ""
+    by = defaultdict(list)
+    for pr in waiting:
+        if pr["isDraft"]:
+            by["draft"].append(pr)
+        elif reviewers(pr):
+            for r in reviewers(pr):
+                by[r].append(pr)
+        elif pr["reviews"]["nodes"]:
+            by["reviewed, no decision"].append(pr)
+        else:
+            by["no reviewer requested"].append(pr)
+    groups = []
+    for who, ps in sorted(by.items(), key=lambda kv: (-len(kv[1]), kv[0])):
+        ps.sort(key=waiting_since)
+        oldest = ago(waiting_since(ps[0]), now)
+        bad = " bad" if who == "no reviewer requested" else ""
+        rows = "".join(f'<li><a class="t" href="{e(p["url"])}">{e(p["title"])}</a><div class="m">{ref(p)}'
+                       f'{flags(p)}<span class="age">{ago(waiting_since(p), now)}</span></div></li>' for p in ps)
+        groups.append(f'<details class="wg{bad}"><summary><b>{e(who)}</b><span>{len(ps)} PR{"s" if len(ps) > 1 else ""}, '
+                      f'oldest {oldest}</span></summary><ul>{rows}</ul></details>')
+    return (f'<section class="card g-wait" id="g-wait"><header><h3>Waiting on others</h3><span class="n">{len(waiting)}</span></header>'
+            f'<p class="hint">{len(waiting)} of your {total} open PRs, by who has to move next</p>{"".join(groups)}</section>')
+
+
+def render_issues(issues, since, now):
+    if not issues:
+        return '<p class="calm">No issue assigned.</p>'
+
+    def arrived(it):
+        return it.get("_assigned") or ts(it["createdAt"])
+
+    def row(it):
+        labs = "".join(f'<span class="lab" style="--c:#{e(l["color"])}">{e(l["name"])}</span>'
+                       for l in it["labels"]["nodes"][:2])
+        ms = f'<span class="ms">{e(it["milestone"]["title"])}</span>' if it.get("milestone") else ""
+        stale = now - ts(it["updatedAt"]) > timedelta(days=STALE_DAYS)
+        quiet = f'<span class="flag">quiet {ago(ts(it["updatedAt"]), now)}</span>' if stale else ""
+        return (f'<li{" class=stale" if stale else ""}><a class="t" href="{e(it["url"])}">{e(it["title"])}</a>'
+                f'<div class="m">{ref(it)}{labs}{ms}{quiet}<span class="age">assigned {ago(arrived(it), now)} ago</span></div></li>')
+
+    return f'<ul class="rows">{"".join(row(x) for x in sorted(issues, key=arrived, reverse=True))}</ul>'
+
+
+def render_follow(data, shown, now):
+    seen = set(shown) | {i["url"] for i in data["assigned"]["nodes"]} | {i["url"] for i in data["_testing"]}
+    items = {}
+    for kind, nodes in (("opened by you", data["created"]["nodes"]), ("mentions you", data["mentioned"]["nodes"])):
+        for it in nodes:
+            if it["url"] not in seen:
+                items.setdefault(it["url"], {**it, "_kind": set()})["_kind"].add(kind)
+    if not items:
+        return ""
+    week = now - timedelta(days=7)
+    repos = defaultdict(list)
+    for it in items.values():
+        repos[it["repository"]["nameWithOwner"]].append(it)
+    order = sorted(repos.items(), key=lambda kv: -max(ts(i["updatedAt"]) for i in kv[1]).timestamp())
+    recent = sum(1 for i in items.values() if ts(i["updatedAt"]) > week)
+    blocks = []
+    for repo, its in order:
+        its.sort(key=lambda i: ts(i["updatedAt"]), reverse=True)
+        rows = "".join(
+            f'<li{" class=new" if ts(i["updatedAt"]) > week else ""}><a class="t" href="{e(i["url"])}">{e(i["title"])}</a>'
+            f'<div class="m"><span class="ref"><i>#{i["number"]}</i></span><span class="why">{", ".join(sorted(i["_kind"]))}</span>'
+            f'<span class="age">active {ago(ts(i["updatedAt"]), now)} ago</span></div></li>' for i in its)
+        blocks.append(f'<h5>{e(short_repo(repo))} <span>{len(its)}</span></h5><ul class="rows">{rows}</ul>')
+    return (f'<details class="notes follow"><summary>Following: issues you opened or that mention you <span>{len(items)}</span>'
+            f'<small>{recent} active this week</small></summary>{"".join(blocks)}</details>')
+
+
+def render_notes(notes, shown, now):
+    keep = [n for n in notes if n["url"] not in shown
+            and n["reason"] in ("mention", "team_mention", "comment", "author", "state_change", "assign")]
+    if not keep:
+        return ""
+    rows = "".join(f'<li><a class="t" href="{e(n["url"])}">{e(n["title"])}</a><div class="m">'
+                   f'<span class="ref">{e(short_repo(n["repo"]))}</span><span class="why">{e(REASONS.get(n["reason"], n["reason"]))}</span>'
+                   f'<span class="age">{ago(n["when"], now)}</span></div></li>' for n in keep[:15])
+    return (f'<details class="notes"><summary>Other unread notifications <span>{len(keep)}</span></summary>'
+            f'<ul class="rows">{rows}</ul></details>')
+
+
+def trend(cur, prev):
+    if prev is None:
+        return ""
+    if cur == prev:
+        return '<span class="tr">same</span>'
+    up = cur > prev
+    return f'<span class="tr {"up" if up else "down"}">{"▲" if up else "▼"} {abs(cur - prev)}</span>'
+
+
+def tile(label, cur, prev, full, pname):
+    same = f"same point: {prev}" if prev is not None else ""
+    tot = f"full period: {full}" if full is not None else ""
+    return (f'<div class="tile"><span class="tl">{label}</span><div class="tv"><b>{cur}</b>{trend(cur, prev)}</div>'
+            f'<span class="tp">{" · ".join(x for x in (same, tot) if x)}</span></div>')
+
+
+def dur(h):
+    if h is None:
+        return "–"
+    if h < 1:
+        return f"{max(1, round(h * 60))} min"
+    if h < 48:
+        return f"{h:.0f} h"
+    return f"{h / 24:.1f} d"
+
+
+def render_react(s):
+    r = s["react"]
+    cells = [("This week", r["w"]), ("Last week", r["pw"]),
+             (f"This month, {s['month_name']}", r["m"]), (s["pmonth_name"], r["pm"])]
+    tiles = "".join(
+        f'<div class="tile"><span class="tl">{name}</span><div class="tv"><b>{dur(m)}</b></div>'
+        f'<span class="tp">{n} review request{"s" if n != 1 else ""}</span></div>'
+        for name, (m, n) in cells)
+    return (f'<h3 class="sub">Your review response time</h3><p class="note">Median time between a review request '
+            f'addressed to you and your first review after it.</p><div class="tiles react">{tiles}</div>')
+
+
+def render_stats(s):
+    w, pw = s["cur_w"], s["prev_w"]
+    if w["merged"] >= pw["merged"]:
+        head = f"Busy week: {w['merged']} PRs merged, against {pw['merged']} at the same point last week."
+    else:
+        head = f"Quieter week: {w['merged']} PRs merged, against {pw['merged']} at the same point last week."
+    out = [f'<p class="finding">{e(head)}</p><div class="periods">']
+    for title, cur, prev, full, pname in (
+            ("This week", s["cur_w"], s["prev_w"], s["full_prev_w"], "last week"),
+            (f"This month, {s['month_name']}", s["cur_m"], s["prev_m"], s["full_prev_m"], s["pmonth_name"])):
+        out.append(f'<div class="period"><h3>{title}<small>compared with {pname}</small></h3><div class="tiles">'
+                   + tile("PRs merged", cur["merged"], prev["merged"], full["merged"], pname)
+                   + tile("Reviews done", cur["reviews"], None, full["reviews"], pname)
+                   + tile("Issues delivered", cur["closed"], prev["closed"], full["closed"], pname)
+                   + "</div></div>")
+    out.append(f'</div>{render_react(s)}<p class="note" style="margin-top:12px">Issues delivered: {QA_REPO} issues closed as completed, '
+               f'that you were assigned to at some point or that one of your PRs references.</p>')
+
+    charts = []
+    for key, name in (("merged", "PRs merged"), ("reviews", "Reviews done"), ("closed", "Issues delivered")):
+        vals = [x[key] for x in s["series"]]
+        top = max(vals) or 1
+        avg = sum(vals[:-1]) / max(1, len(vals) - 1)
+        bars = "".join(
+            f'<div class="bar{" cur" if i == len(vals) - 1 else ""}" title="week of {x["week"]:%b %d}: {v}">'
+            f'<span>{v or ""}</span><i style="height:{v / top * 100:.1f}%"></i></div>'
+            for i, (x, v) in enumerate(zip(s["series"], vals)))
+        avg_line = f'<div class="avg" style="bottom:{avg / top * 100:.1f}%"></div>' if avg else ""
+        charts.append(f'<div class="chart"><h4>{name}<small>- - moyenne {avg:.1f} / sem.</small></h4><div class="bars">{bars}{avg_line}</div>'
+                      f'<div class="axis"><span>week of {s["series"][0]["week"]:%b %d}</span><span>this week</span></div></div>')
+    out.append(f'<div class="stats-grid"><section><h3 class="sub">Last {WEEKS} weeks</h3><div class="charts">' + "".join(charts) + "</div></section>")
+
+    if s["repos"]:
+        top_m = max(c["merged"] for _, c in s["repos"]) or 1
+        top_r = max(c["reviews"] for _, c in s["repos"]) or 1
+        rows = "".join(
+            f'<tr><td>{e(short_repo(r))}</td>'
+            f'<td><div class="hb"><i style="width:{c["merged"] / top_m * 100:.0f}%"></i><span>{c["merged"] or ""}</span></div></td>'
+            f'<td><div class="hb rv"><i style="width:{c["reviews"] / top_r * 100:.0f}%"></i><span>{c["reviews"] or ""}</span></div></td>'
+            f'<td class="num">{c["closed"] or ""}</td></tr>' for r, c in s["repos"][:15])
+        lead = ""
+        if s["lead_median"] is not None:
+            h = s["lead_median"]
+            lead = f' Median time from opening to merge: <b>{f"{h:.0f} h" if h < 48 else f"{h / 24:.1f} days"}</b>.'
+        out.append(f'<section><h3 class="sub">Where your time went in {s["month_name"]}</h3>'
+                   f'<p class="note">Repositories sorted by total activity. A delivered issue counts in the repository of your PR that references it.{lead}</p><div class="scroll"><table>'
+                   f'<thead><tr><th>Repository</th><th>PRs merged</th><th>Reviews</th><th class="num">Issues delivered</th></tr></thead>'
+                   f'<tbody>{rows}</tbody></table></div></section>')
+    out.append("</div>")
+    return "".join(out)
+
+
+CSS = """
+/* VOICE work, a morning briefing
+   IDEA a newsroom desk: what needs me first, then where my work stands
+   PICTURE the action strip, then the PR pipeline as a four-column board
+   COLOUR white or near-black ground, ink, teal lead, claret for urgent, one colour per action
+   TYPE Libre Franklin 800 + Libre Franklin
+   LAYOUT laptop: strip across, action cards in a grid, pipeline full width; phone: everything stacks */
+:root{color-scheme:light dark;--bg:light-dark(#ffffff,#121417);--ink:light-dark(#17191c,#e9eaec);--mute:light-dark(#5f646b,#9ba1a8);--rule:light-dark(#e4e6e9,#262a2f);--panel:light-dark(#f5f6f7,#1a1d21);--acc:light-dark(#0d7680,#4cb5be);--hot:light-dark(#b0123e,#ff6d8c);--g-review:light-dark(#0e7490,#22d3ee);--g-reply:light-dark(#be123c,#fb7185);--g-fix:light-dark(#c2410c,#fb923c);--g-merge:light-dark(#15803d,#4ade80);--g-new:light-dark(#6d28d9,#a78bfa);--g-release:light-dark(#a16207,#facc15);--g-testing:light-dark(#1d4ed8,#60a5fa)}
+*{box-sizing:border-box;min-width:0}
+body{margin:0;background:var(--bg);color:var(--ink);font:15px/1.5 "Libre Franklin",system-ui,sans-serif;overflow-x:clip}
+a{color:inherit;text-decoration:none}
+a.t:hover{color:var(--acc)}
+.wrap{max-width:2560px;margin:0 auto;padding:32px max(4vw,16px) 72px}
+.top{display:flex;flex-wrap:wrap;justify-content:space-between;align-items:flex-end;gap:16px 32px}
+h1{font-size:clamp(30px,4.2vw,44px);line-height:1.05;letter-spacing:-.025em;margin:0;font-weight:800}
+.lede{margin:8px 0 0;font-size:17px;color:var(--mute);max-width:60ch}.lede b{color:var(--ink)}
+nav{display:flex;background:var(--panel);border-radius:999px;padding:4px}
+nav button{font:inherit;font-weight:600;font-size:14px;border:0;background:none;color:var(--mute);padding:8px 18px;border-radius:999px;cursor:pointer}
+nav button[aria-pressed=true]{background:var(--bg);color:var(--ink);box-shadow:0 1px 2px rgb(0 0 0/.12)}
+.strip{display:grid;grid-template-columns:repeat(7,minmax(0,1fr));margin:28px 0 8px;border-top:2px solid var(--ink);border-bottom:1px solid var(--rule)}
+.cell{padding:14px 16px 16px;border-left:1px solid var(--rule);display:flex;flex-direction:column;position:relative}
+.cell:first-child{border-left:0;padding-left:0}
+.cell b{font-size:clamp(30px,4vw,44px);line-height:1;font-weight:800;font-variant-numeric:tabular-nums;color:var(--c)}
+.cell span{font-weight:600;margin-top:6px}
+.cell small{font-size:13px;color:var(--mute)}
+a.cell:hover span{text-decoration:underline}
+.cell.zero b{color:var(--rule)}.cell.zero span{color:var(--mute);font-weight:500}
+.g-release{--c:var(--g-release)}.g-testing{--c:var(--g-testing)}.g-review{--c:var(--g-review)}.g-reply{--c:var(--g-reply)}.g-fix{--c:var(--g-fix)}.g-merge{--c:var(--g-merge)}.g-new{--c:var(--g-new)}
+h2{font-size:22px;letter-spacing:-.015em;margin:44px 0 4px;font-weight:800}
+.h2note{margin:0 0 16px;color:var(--mute)}
+.cards{display:grid;grid-template-columns:repeat(auto-fill,minmax(min(100%,380px),1fr));gap:28px 24px;align-items:start;margin-top:24px}.card{margin:0}
+.card{border-top:3px solid var(--c);padding-top:12px;scroll-margin-top:16px}.cards>.card:last-child{margin-bottom:0}
+.card header{display:flex;align-items:baseline;gap:10px}
+.card h3{margin:0;font-size:18px}
+.card .n{font-weight:800;color:var(--c);font-variant-numeric:tabular-nums}
+.hint{margin:0 0 6px;font-size:13px;color:var(--mute)}
+ul{list-style:none;margin:0;padding:0}
+.card li,.rows li{padding:10px 0;border-bottom:1px solid var(--rule)}
+.card li:last-child{border-bottom:0}
+.t{font-weight:600;display:block;line-height:1.35}
+li.new .t::before{content:"";display:inline-block;width:8px;height:8px;border-radius:50%;background:var(--hot);margin-right:8px;vertical-align:2px}
+.m{display:flex;flex-wrap:wrap;align-items:center;gap:2px 10px;margin-top:3px;font-size:13px;color:var(--mute)}
+.ref{font-variant-numeric:tabular-nums}.ref i{font-style:normal;opacity:.7}
+.why{color:var(--ink)}
+.age{margin-left:auto;white-space:nowrap;font-variant-numeric:tabular-nums}
+.calm{font-size:17px;color:var(--mute);padding:20px 0}
+
+
+
+
+
+
+
+
+
+
+.fl{display:flex;gap:6px;flex-wrap:wrap}
+.flag{font-size:12px;font-weight:600;padding:1px 7px;border-radius:4px;background:var(--panel);color:var(--mute)}
+.flag.bad{background:color-mix(in srgb,var(--hot) 14%,transparent);color:var(--hot)}
+.none{margin:0;font-size:13px;color:var(--mute)}
+.bucket{margin-top:18px}
+.bucket h4,.bucket summary,.notes summary{font-size:14px;font-weight:700;margin:0 0 2px;color:var(--mute)}
+.bucket h4 span,summary span{color:var(--ink)}
+summary{cursor:pointer;padding:6px 0}
+.notes{margin-top:36px}
+.lab{font-size:12px;padding:0 7px;border-radius:999px;color:var(--ink);background:color-mix(in srgb,var(--c) 22%,transparent)}
+.ms{font-size:12px;padding:0 7px;border-radius:4px;border:1px solid var(--rule)}
+.finding{font-size:clamp(20px,2.4vw,26px);font-weight:700;letter-spacing:-.015em;line-height:1.25;margin:32px 0 0;max-width:40ch}
+.periods{display:grid;grid-template-columns:repeat(auto-fit,minmax(min(100%,440px),1fr));gap:24px 48px;margin-top:28px}
+.period h3{margin:0 0 10px;font-size:15px}
+.tiles{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));border-top:2px solid var(--ink)}
+.tile{padding:12px 14px 4px 0;display:flex;flex-direction:column}
+.tile+.tile{padding-left:14px;border-left:1px solid var(--rule)}
+.tl{font-size:13px;font-weight:600}
+.tv{display:flex;align-items:baseline;gap:8px}
+.tv b{font-size:clamp(30px,3.6vw,40px);font-weight:800;line-height:1.1;font-variant-numeric:tabular-nums}
+.tr{font-size:13px;font-weight:700;color:var(--mute);white-space:nowrap}.tr.up{color:var(--g-merge)}.tr.down{color:var(--hot)}
+.tp{font-size:12px;color:var(--mute)}
+h3.sub{font-size:18px;margin:44px 0 14px}
+.charts{display:grid;grid-template-columns:repeat(auto-fit,minmax(min(100%,300px),1fr));gap:24px 40px}
+.chart h4{margin:0 0 10px;font-size:14px;display:flex;justify-content:space-between;gap:8px}.chart h4 small,.period h3 small{font-weight:400;color:var(--mute);font-size:13px}.period h3{display:flex;justify-content:space-between;gap:8px}
+.bars{display:grid;grid-template-columns:repeat(12,minmax(0,1fr));gap:3px;height:150px;align-items:end;border-bottom:1px solid var(--ink);position:relative}
+.bar{height:100%;display:flex;flex-direction:column;justify-content:flex-end;align-items:center}
+.bar i{display:block;width:100%;background:color-mix(in srgb,var(--acc) 35%,var(--bg));border-radius:2px 2px 0 0}
+.bar.cur i{background:var(--acc)}
+.bar span{font-size:11px;color:var(--mute);font-variant-numeric:tabular-nums}
+.avg{position:absolute;left:0;right:0;border-top:1px dashed var(--mute);pointer-events:none}
+.axis{display:flex;justify-content:space-between;font-size:12px;color:var(--mute);margin-top:4px}
+.note{color:var(--mute);margin:-6px 0 12px}.note b{color:var(--ink)}
+.scroll{overflow-x:auto}
+table{border-collapse:collapse;width:100%;font-variant-numeric:tabular-nums}
+th,td{text-align:left;padding:7px 10px 7px 0;border-bottom:1px solid var(--rule)}
+th{font-size:13px;color:var(--mute);font-weight:600}
+td:first-child{white-space:nowrap}
+.num{text-align:right}
+.hb{display:flex;align-items:center;gap:8px;min-width:120px}
+.hb i{display:block;height:10px;border-radius:2px;background:var(--acc)}
+.hb.rv i{background:var(--g-new)}
+.hb span{font-size:13px}
+footer{margin-top:56px;padding-top:14px;border-top:1px solid var(--rule);font-size:13px;color:var(--mute)}
+code{font-size:13px}
+.daily{margin-top:28px}
+.dhead{display:flex;flex-wrap:wrap;justify-content:space-between;align-items:center;gap:12px;margin-bottom:20px}
+.dhead .h2note{margin:0}
+#copy{font:inherit;font-weight:700;border:0;background:var(--ink);color:var(--bg);padding:10px 20px;border-radius:999px;cursor:pointer;min-height:44px}
+#copy:hover{background:var(--acc)}
+.dgrid{display:grid;grid-template-columns:repeat(auto-fit,minmax(min(100%,340px),1fr));gap:24px 40px}
+.dblock{border-top:2px solid var(--ink);padding-top:10px}
+.dblock h3{margin:0 0 8px;font-size:18px}
+.dblock li{padding:8px 0;border-bottom:1px solid var(--rule);line-height:1.4}
+.dblock li.none{color:var(--mute)}
+.qa{margin-top:14px;padding-top:10px;border-top:1px dashed color-mix(in srgb,var(--c) 50%,var(--rule))}
+.qa h4{margin:0 0 2px;font-size:13px;font-weight:600;color:var(--mute)}
+.qa h4 span{color:var(--ink)}
+.qa li{opacity:.75}
+.qa .t{font-weight:500}
+.card li{position:relative}
+.act{position:absolute;top:6px;right:0;display:flex;gap:6px;padding:2px 0 2px 12px;background:linear-gradient(90deg,transparent,var(--bg) 12px);opacity:0;pointer-events:none;transition:opacity .15s}
+.card li:hover .act,.card li:focus-within .act{opacity:1;pointer-events:auto}
+@media(hover:none){.act{position:static;opacity:1;pointer-events:auto;margin-top:6px;background:none;padding:0}}
+.act button,#unhide{font:inherit;font-size:12px;font-weight:600;border:1px solid var(--rule);background:var(--bg);color:var(--mute);border-radius:999px;padding:3px 10px;cursor:pointer}
+.act button:hover,#unhide:hover{color:var(--ink);border-color:var(--ink)}
+.hidden-note{font-size:13px;color:var(--mute);margin-top:18px}
+.who{font-size:12px;color:var(--mute)}
+.who.bad{color:var(--hot);font-weight:600}
+.follow summary small{font-weight:400;margin-left:8px}
+.follow h5{margin:14px 0 0;font-size:13px;color:var(--mute)}
+.follow h5 span{color:var(--ink)}
+.tiles.react{grid-template-columns:repeat(4,minmax(0,1fr));max-width:900px}
+@media(max-width:640px){.tiles.react{grid-template-columns:repeat(2,minmax(0,1fr))}}
+.rows li.stale{opacity:.6}
+.g-wait{--c:var(--mute)}
+.wg{border-bottom:1px solid var(--rule)}
+.wg summary{display:flex;justify-content:space-between;gap:8px;padding:9px 0;cursor:pointer;list-style:none}
+.wg summary::-webkit-details-marker{display:none}
+.wg summary b{font-weight:600}
+.wg summary span{font-size:13px;color:var(--mute);white-space:nowrap}
+.wg.bad summary b{color:var(--hot)}
+.wg[open] summary b::after{content:" ▴";color:var(--mute)}
+.wg:not([open]) summary b::after{content:" ▾";color:var(--mute)}
+.wg li{padding:6px 0 8px 12px}
+.board{display:block}
+.side-col h2:first-child{margin-top:44px}
+@media(min-width:1600px){
+body{font-size:16px}
+.wrap{padding-left:max(3vw,32px);padding-right:max(3vw,32px)}
+.board{display:grid;grid-template-columns:minmax(0,1fr) minmax(380px,30%);gap:56px;align-items:start}
+.side-col{position:sticky;top:0;max-height:100vh;overflow-y:auto;padding:0 4px 24px 0;scrollbar-width:thin}
+.side-col h2:first-child{margin-top:24px}
+.stats-grid{display:grid;grid-template-columns:minmax(0,1fr) minmax(0,1fr);gap:56px;align-items:start}
+.charts{grid-template-columns:minmax(0,1fr)}
+.bars{height:170px}
+}
+@media(min-width:2200px){
+body{font-size:17px}
+.board{grid-template-columns:minmax(0,1fr) minmax(440px,28%)}
+.charts{grid-template-columns:repeat(2,minmax(0,1fr))}
+.charts .chart:first-child{grid-column:1/-1}
+}
+@media(max-width:640px){.strip{grid-template-columns:repeat(4,minmax(0,1fr))}.cell:nth-child(4n+1){border-left:0;padding-left:0}.cell:nth-child(n+5){border-top:1px solid var(--rule)}.tiles{grid-template-columns:minmax(0,1fr)}.tile+.tile{padding-left:0;border-left:0;border-top:1px solid var(--rule)}}
+"""
+
+JS = """
+{const bs=[...document.querySelectorAll('nav button')];
+const show=v=>{bs.forEach(b=>b.setAttribute('aria-pressed',b.dataset.v===v));document.querySelectorAll('[data-view]').forEach(s=>s.hidden=s.dataset.view!==v)};
+bs.forEach(b=>b.onclick=()=>{show(b.dataset.v);history.replaceState(null,'','#'+b.dataset.v)});
+show(['stats','daily'].includes(location.hash.slice(1))?location.hash.slice(1):'jour');
+const cp=document.getElementById('copy');
+if(cp)cp.onclick=async()=>{const t=document.getElementById('dtext').value;try{await navigator.clipboard.writeText(t);cp.textContent='Copied'}catch(_){const a=document.getElementById('dtext');a.hidden=false;a.select();document.execCommand('copy');a.hidden=true;cp.textContent='Copied'}setTimeout(()=>cp.textContent='Copy text',2000)};
+const post=(u,b)=>fetch(u,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(b||{})}).then(()=>location.reload());
+document.querySelectorAll('.act button').forEach(b=>b.onclick=ev=>{ev.preventDefault();const a=b.parentElement;a.closest('li').style.opacity=.3;post('/hide',{k:a.dataset.k,w:a.dataset.w,m:b.dataset.m})});
+const uh=document.getElementById('unhide');if(uh)uh.onclick=()=>post('/unhide-all');
+if(document.body.dataset.live==='1'){const t0=Date.now();const tick=()=>{if(document.visibilityState==='visible'&&Date.now()-t0>300000&&!document.querySelector('details[open]'))location.reload()};setInterval(tick,30000);document.addEventListener('visibilitychange',tick)}}
+"""
+
+
+def cached_stats(now):
+    # History moves slowly and costs most of the API time, so it is refreshed at most hourly.
+    try:
+        c = json.loads(STATS_CACHE.read_text())
+        if now - ts(c["at"]) < STATS_TTL:
+            return c
+    except (OSError, ValueError, KeyError):
+        pass
+    st = stats(now)
+    c = {"at": iso(now), "html": render_stats(st), "week_merged": st["cur_w"]["merged"]}
+    STATS_CACHE.parent.mkdir(parents=True, exist_ok=True)
+    STATS_CACHE.write_text(json.dumps(c))
+    return c
+
+
+DAILY_QUERY = """
+query($merged: String!, $opened: String!, $reviewed: String!) {
+  merged: search(type: ISSUE, first: 100, query: $merged) { nodes { ... on PullRequest { number title url repository { nameWithOwner } } } }
+  opened: search(type: ISSUE, first: 100, query: $opened) { nodes { ... on PullRequest { number title url isDraft mergedAt repository { nameWithOwner } } } }
+  reviewed: search(type: ISSUE, first: 100, query: $reviewed) {
+    nodes { ... on PullRequest { number title url repository { nameWithOwner }
+      reviews(last: 50) { nodes { author { login } state submittedAt } } } }
+  }
+}
+"""
+EN_DAYS = ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday"]
+REFRESH = 300
+
+
+def previous_workday(local):
+    d = local.replace(hour=0, minute=0, second=0, microsecond=0) - timedelta(days=1)
+    while d.weekday() >= 5:
+        d -= timedelta(days=1)
+    return d, d + timedelta(days=1)
+
+
+def daily_data(me, now):
+    a, b = previous_workday(now.astimezone())
+    day = a.strftime("%Y-%m-%d")
+    d = graphql(DAILY_QUERY, merged=f"is:pr author:@me merged:{day}", opened=f"is:pr author:@me created:{day}",
+                reviewed=f"is:pr reviewed-by:@me -author:@me updated:>={day}")
+    reviewed = []
+    for pr in d["reviewed"]["nodes"]:
+        mine = [r["state"] for r in pr["reviews"]["nodes"]
+                if (r.get("author") or {}).get("login") == me and r.get("submittedAt") and a <= ts(r["submittedAt"]) < b]
+        if mine:
+            pr["_state"] = "APPROVED" if "APPROVED" in mine else mine[-1]
+            reviewed.append(pr)
+    merged_urls = {p["url"] for p in d["merged"]["nodes"]}
+    opened = [p for p in d["opened"]["nodes"] if p["url"] not in merged_urls]
+    return {"start": iso(a), "merged": d["merged"]["nodes"], "opened": opened, "reviewed": reviewed}
+
+
+def fetch():
+    now = datetime.now(timezone.utc)
+    with ThreadPoolExecutor(3) as ex:
+        f_data, f_notes, f_st = ex.submit(graphql, NOW_QUERY), ex.submit(notifications), ex.submit(cached_stats, now)
+        data, notes, st = f_data.result(), f_notes.result(), f_st.result()
+    daily = daily_data(data["viewer"]["login"], now)
+    return {"at": now, "data": data, "notes": notes, "stats": st, "daily": daily}
+
+
+def pr_ref(p):
+    return f'{short_repo(p["repository"]["nameWithOwner"])}#{p["number"]}'
+
+
+def collapse(prs):
+    """Group sweeps that land the same title in many repos into one line."""
+    by_title = defaultdict(list)
+    for p in prs:
+        by_title[p["title"]].append(p)
+    lines = []
+    for title, ps in by_title.items():
+        if len(ps) > 2:
+            lines.append(f"{title} ({len(ps)} repos)")
+        else:
+            lines.append(f"{title} ({', '.join(pr_ref(p) for p in ps)})")
+    return lines
+
+
+def daily_text(f, groups, now):
+    data, d = f["data"], f["daily"]
+    start = ts(d["start"]).astimezone()
+    label = "Friday" if now.astimezone().weekday() == 0 else "Yesterday"
+    y = []
+    y += [f"Merged: {l}" for l in collapse(d["merged"])]
+    y += [f"Opened: {l}" for l in collapse(d["opened"])]
+    states = {"APPROVED": "approved", "CHANGES_REQUESTED": "asked for changes", "COMMENTED": "commented"}
+    y += [f"Reviewed {pr_ref(p)}, {states.get(p['_state'], 'reviewed')}: {p['title']}" for p in d["reviewed"]]
+    a, b = ts(d["start"]), ts(d["start"]) + timedelta(days=1)
+    for iss in data["qa"]["nodes"]:
+        if iss.get("_since") and a <= iss["_since"] < b:
+            st = "verified" if any(l["name"] == "verified" for l in iss["labels"]["nodes"]) else "moved to testing"
+            y.append(f"QA {st}: dev#{iss['number']} {iss['title']}")
+
+    t = []
+    for g in groups["release"]:
+        it = g["item"]
+        rep = g["reason"].split("release ", 1)[1] if "release " in g["reason"] else "the package"
+        t.append(f"Release {rep} for dev#{it['number']} {it['title']}")
+    for g in groups["reply"]:
+        t.append(f"Answer {pr_ref(g['item'])}: {g['item']['title']}")
+    for g in groups["fix"]:
+        t.append(f"Fix {'CI' if 'CI' in g['reason'] else 'conflict'} on {pr_ref(g['item'])}: {g['item']['title']}")
+    for g in groups["merge"]:
+        t.append(f"Merge {pr_ref(g['item'])}: {g['item']['title']}")
+    for g in groups["review"]:
+        t.append(f"Review {pr_ref(g['item'])}: {g['item']['title']}")
+    for g in groups["new"]:
+        t.append(f"Start dev#{g['item']['number']}: {g['item']['title']}")
+
+    shown = {x["item"]["url"] for v in groups.values() for x in v}
+    waiting = [p for p in data["mine"]["nodes"] if p["url"] not in shown and not p["isDraft"]]
+    blk = []
+    if waiting:
+        oldest = min(waiting, key=lambda p: ts(p["createdAt"]))
+        blk.append(f"{len(waiting)} PRs waiting for review, oldest {ago(ts(oldest['createdAt']), now).replace(' d', ' days').replace(' h', 'h')}: {pr_ref(oldest)}")
+    if data["_testing"]:
+        blk.append(f"{len(data['_testing'])} issues in QA testing: " + ", ".join(f"dev#{i['number']}" for i in data["_testing"]))
+
+    def section(title, lines, empty):
+        return title + "\n" + ("\n".join(f"- {l}" for l in lines) if lines else f"- {empty}")
+
+    return {"title_y": f"{label} ({EN_DAYS[start.weekday()]} {start.day})", "y": y, "t": t, "b": blk,
+            "text": "\n\n".join([section(f"{label}:", y, "nothing recorded on GitHub"),
+                                 section("Today:", t, "continue current issues"),
+                                 section("Blockers:", blk, "none")])}
+
+
+def render_daily(dt):
+    def block(title, lines, empty):
+        lis = "".join(f"<li>{e(l)}</li>" for l in lines) or f'<li class="none">{empty}</li>'
+        return f'<section class="dblock"><h3>{title}</h3><ul>{lis}</ul></section>'
+    return (f'<div class="daily"><div class="dhead"><p class="h2note">Ready to paste in the daily channel. '
+            f'"{e(dt["title_y"])}" covers the last working day.</p>'
+            f'<button id="copy" type="button">Copy text</button></div>'
+            f'<div class="dgrid">{block(e(dt["title_y"]), dt["y"], "nothing on GitHub")}'
+            f'{block("Today", dt["t"], "nothing planned")}{block("Blockers", dt["b"], "none")}</div>'
+            f'<textarea id="dtext" readonly hidden>{e(dt["text"])}</textarea></div>')
+
+
+def render(f, since, live=False):
+    now = datetime.now(timezone.utc)
+    data = copy.deepcopy(f["data"])
+    notes, st = f["notes"], f["stats"]
+    me = data["viewer"]["login"]
+    groups = analyse(data, me, since, now)
+    hidden = apply_hidden(groups, now)
+    dt = daily_text({**f, "data": data}, groups, now)
+    local = now.astimezone()
+
+    total = sum(len(v) for g, v in groups.items() if g != "testing")
+    fresh = sum(1 for g, v in groups.items() if g != "testing" for t in v if t["new"])
+    if total:
+        lede = f"<b>{total} action{'s' if total > 1 else ''}</b> waiting for you"
+        lede += f", {fresh} new" if fresh else ""
+    else:
+        lede = "Nothing waits for you"
+    lede += f". Last visit {ago(since, now)} ago."
+    shown = {t["item"]["url"] for v in groups.values() for t in v}
+    mine = data["mine"]["nodes"]
+    waiting = sum(1 for pr in mine if pr["url"] not in shown)
+    fetched = f["at"].astimezone()
+    foot = (f"Data from {fetched:%H:%M}, refreshed every {REFRESH // 60} min. The page reloads by itself."
+            if live else f"Data from {fetched:%H:%M}. Run <code>ghday</code> again to refresh.")
+
+    return f"""<!doctype html><html lang="en"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1"><title>GitHub day</title>
+<link rel="preconnect" href="https://fonts.googleapis.com"><link href="https://fonts.googleapis.com/css2?family=Libre+Franklin:wght@400;500;600;700;800&display=swap" rel="stylesheet">
+<style>{CSS}</style></head><body data-live="{1 if live else 0}"><div class="wrap">
+<div class="top"><div><h1>{DAYS[local.weekday()]}, {MONTHS[local.month - 1]} {local.day}</h1><p class="lede">{lede}</p></div>
+<nav><button data-v="jour" aria-pressed="true">Today</button><button data-v="daily" aria-pressed="false">Daily</button><button data-v="stats" aria-pressed="false">Stats</button></nav></div>
+<main data-view="jour">
+{render_strip(groups)}
+<div class="board"><div class="main-col">
+{render_groups(groups, now, live, hidden, render_waiting(mine, shown, data["mine"]["issueCount"], now))}
+</div><aside class="side-col">
+<h2>My issues</h2><p class="h2note">{data["assigned"]["issueCount"]} assigned, newest first.</p>
+{render_issues(data["assigned"]["nodes"], since, now)}
+{render_follow(data, shown, now)}
+{render_notes(notes, shown, now)}
+</aside></div>
+</main>
+<main data-view="daily" hidden>{render_daily(dt)}</main>
+<main data-view="stats" hidden>{st["html"]}<p class="note" style="margin-top:24px">Computed {ago(ts(st["at"]), now)} ago, at most once per hour.</p></main>
+<footer>{foot} Account {e(me)}, through <code>gh</code>.</footer>
+</div><script>{JS}</script></body></html>"""
+
+
+def build():
+    f = fetch()
+    page = render(f, visit_threshold(f["at"]))
+    OUT.parent.mkdir(parents=True, exist_ok=True)
+    OUT.write_text(page)
+    return page
+
+
+HIDDEN = STATE.with_name("hidden.json")
+HIDE_LOCK = threading.Lock()
+
+
+def load_hidden():
+    try:
+        return json.loads(HIDDEN.read_text())
+    except (OSError, ValueError):
+        return {}
+
+
+def save_hidden(h):
+    HIDDEN.parent.mkdir(parents=True, exist_ok=True)
+    HIDDEN.write_text(json.dumps(h))
+
+
+def apply_hidden(groups, now):
+    """Drop hidden or snoozed items, unless something happened on them after they were hidden."""
+    h, count = load_hidden(), 0
+    for g, items in groups.items():
+        keep = []
+        for t in items:
+            rule = h.get(f"{g}|{t['item']['url']}")
+            active = rule and (rule["until"] is None or ts(rule["until"]) > now)
+            quiet = rule and (t["when"] is None or t["when"] <= ts(rule["seen"]))
+            if active and quiet:
+                count += 1
+            else:
+                keep.append(t)
+        groups[g] = keep
+    return count
+
+
+def hide_item(key, seen, mode):
+    local = datetime.now().astimezone()
+    until = None
+    if mode == "snooze":
+        until = iso((local + timedelta(days=1)).replace(hour=7, minute=0, second=0, microsecond=0))
+    with HIDE_LOCK:
+        h = load_hidden()
+        h[key] = {"until": until, "seen": seen or iso(datetime.now(timezone.utc))}
+        save_hidden(h)
+
+
+NOTIFY_STATE = STATE.with_name("notified.json")
+NOTIFY_LABELS = {"release": "To release", "review": "To review", "reply": "To answer",
+                 "fix": "To fix", "merge": "To merge", "new": "New issue"}
+
+
+def notify_new(f):
+    data = copy.deepcopy(f["data"])
+    groups = analyse(data, data["viewer"]["login"], f["at"], f["at"])
+    current = {f"{g}|{t['item']['url']}": t for g, v in groups.items() if g != "testing" for t in v}
+    try:
+        known = set(json.loads(NOTIFY_STATE.read_text()))
+    except (OSError, ValueError):
+        known = None
+    NOTIFY_STATE.parent.mkdir(parents=True, exist_ok=True)
+    NOTIFY_STATE.write_text(json.dumps(sorted(current)))
+    # First run only records the baseline, so a restart does not replay every open item.
+    if known is None:
+        return
+    for key in sorted(set(current) - known):
+        t = current[key]
+        g = key.split("|", 1)[0]
+        urgency = "critical" if g == "release" else "normal"
+        subprocess.run(["notify-send", "--app-name=GitHub", f"--urgency={urgency}", "--icon=dialog-information",
+                        f"{NOTIFY_LABELS[g]} · {short_repo(t['item']['repository']['nameWithOwner'])}#{t['item']['number']}",
+                        f"{t['item']['title']}\n{t['reason']}"], check=False)
+
+
+def serve(port):
+    cache = {"f": None, "err": None}
+    lock = threading.Lock()
+
+    def refresh():
+        try:
+            f = fetch()
+            with lock:
+                cache["f"], cache["err"] = f, None
+            notify_new(f)
+        except Exception as ex:  # keep serving the last good data when GitHub or gh hiccups
+            cache["err"] = str(ex)
+            print(f"ghday: refresh failed: {ex}", file=sys.stderr, flush=True)
+
+    def loop():
+        while True:
+            time.sleep(REFRESH)
+            refresh()
+
+    class H(BaseHTTPRequestHandler):
+        def do_GET(self):
+            if self.path not in ("/", "/index.html"):
+                self.send_error(404)
+                return
+            with lock:
+                f = cache["f"]
+            if f is None:
+                refresh()
+                f = cache["f"]
+            if f is None:
+                body, code = f"<pre>ghday: {e(cache['err'] or 'no data')}</pre>".encode(), 500
+            else:
+                body, code = render(f, visit_threshold(datetime.now(timezone.utc)), live=True).encode(), 200
+            self.send_response(code)
+            self.send_header("Content-Type", "text/html; charset=utf-8")
+            self.send_header("Cache-Control", "no-store")
+            self.end_headers()
+            self.wfile.write(body)
+
+        def do_POST(self):
+            try:
+                n = int(self.headers.get("Content-Length") or 0)
+                body = json.loads(self.rfile.read(n) or b"{}")
+                if self.path == "/hide" and body.get("m") in ("hide", "snooze") and body.get("k"):
+                    hide_item(str(body["k"]), body.get("w") or None, body["m"])
+                elif self.path == "/unhide-all":
+                    with HIDE_LOCK:
+                        save_hidden({})
+                else:
+                    self.send_error(400)
+                    return
+            except (ValueError, OSError):
+                self.send_error(400)
+                return
+            self.send_response(204)
+            self.end_headers()
+
+        def log_message(self, *a):
+            pass
+
+    refresh()
+    threading.Thread(target=loop, daemon=True).start()
+    print(f"http://127.0.0.1:{port}/", flush=True)
+    ThreadingHTTPServer(("127.0.0.1", port), H).serve_forever()
+
+
+if __name__ == "__main__":
+    cmd = sys.argv[1] if len(sys.argv) > 1 else "open"
+    if cmd == "serve":
+        serve(int(sys.argv[2]) if len(sys.argv) > 2 else 8765)
+    elif cmd == "build":
+        build()
+        print(OUT)
+    else:
+        build()
+        webbrowser.open(OUT.as_uri())
