@@ -44,6 +44,9 @@ fragment I on Issue {
   timelineItems(itemTypes: [ASSIGNED_EVENT], last: 10) {
     nodes { ... on AssignedEvent { createdAt assignee { ... on User { login } } } }
   }
+  refs: timelineItems(itemTypes: [CROSS_REFERENCED_EVENT], last: 20) {
+    nodes { ... on CrossReferencedEvent { source { ... on PullRequest { author { login } state } } } }
+  }
 }
 fragment P on PullRequest {
   number title url isDraft createdAt updatedAt mergeable reviewDecision
@@ -250,7 +253,11 @@ def analyse(data, me, since, now):
         iss["_assigned"] = max(evts) if evts else None
         other, mine_t = other_activity(iss, me)
         iss["_other"] = other
-        if iss["_assigned"] and now - iss["_assigned"] < timedelta(days=3):
+        # An open or merged PR of mine on the issue means the work has already started.
+        started = any((n.get("source") or {}).get("state") in ("OPEN", "MERGED")
+                      and ((n["source"].get("author") or {}).get("login")) == me
+                      for n in iss["refs"]["nodes"] if n)
+        if iss["_assigned"] and now - iss["_assigned"] < timedelta(days=3) and not started:
             add("new", iss, "assigned to you", iss["_assigned"])
         if other and mine_t and other[0] > mine_t:
             add("reply", iss, f"{other[1]} commented after you", other[0])
