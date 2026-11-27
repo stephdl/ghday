@@ -585,9 +585,19 @@ def my_move(groups):
 
 def render_waiting(prs, shown, total, now):
     """Open PRs with no action for me, grouped by who has to move next."""
-    waiting = [p for p in prs if p["url"] not in shown]
+    left = [p for p in prs if p["url"] not in shown]
+    # Nobody to wait for yet: I am still working on these, so they get their own card.
+    solo = [p for p in left if not p["isDraft"] and not reviewers(p) and not p["reviews"]["nodes"]]
+    waiting = [p for p in left if p not in solo]
+    out = ""
+    if solo:
+        solo.sort(key=lambda p: ts(p["createdAt"]))
+        rows = "".join(f'<li><a class="t" href="{e(p["url"])}">{e(p["title"])}</a><div class="m">{ref(p)}'
+                       f'{flags(p)}<span class="age">opened {ago(ts(p["createdAt"]), now)} ago</span></div></li>' for p in solo)
+        out += (f'<section class="card g-solo" id="g-solo"><header><h3>No reviewer yet</h3><span class="n">{len(solo)}</span></header>'
+                f'<p class="hint">still on your side, request a review when ready</p><ul>{rows}</ul></section>')
     if not waiting:
-        return ""
+        return out
     by = defaultdict(list)
     for pr in waiting:
         if pr["isDraft"]:
@@ -595,20 +605,17 @@ def render_waiting(prs, shown, total, now):
         elif reviewers(pr):
             for r in reviewers(pr):
                 by[r].append(pr)
-        elif pr["reviews"]["nodes"]:
-            by["reviewed, no decision"].append(pr)
         else:
-            by["no reviewer requested"].append(pr)
+            by["reviewed, no decision"].append(pr)
     groups = []
     for who, ps in sorted(by.items(), key=lambda kv: (-len(kv[1]), kv[0])):
         ps.sort(key=waiting_since)
         oldest = ago(waiting_since(ps[0]), now)
-        bad = " bad" if who == "no reviewer requested" else ""
         rows = "".join(f'<li><a class="t" href="{e(p["url"])}">{e(p["title"])}</a><div class="m">{ref(p)}'
                        f'{flags(p)}<span class="age">{ago(waiting_since(p), now)}</span></div></li>' for p in ps)
-        groups.append(f'<details class="wg{bad}"><summary><b>{e(who)}</b><span>{len(ps)} PR{"s" if len(ps) > 1 else ""}, '
+        groups.append(f'<details class="wg"><summary><b>{e(who)}</b><span>{len(ps)} PR{"s" if len(ps) > 1 else ""}, '
                       f'oldest {oldest}</span></summary><ul>{rows}</ul></details>')
-    return (f'<section class="card g-wait" id="g-wait"><header><h3>Waiting on others</h3><span class="n">{len(waiting)}</span></header>'
+    return out + (f'<section class="card g-wait" id="g-wait"><header><h3>Waiting on others</h3><span class="n">{len(waiting)}</span></header>'
             f'<p class="hint">{len(waiting)} of your {total} open PRs, by who has to move next</p>{"".join(groups)}</section>')
 
 
@@ -802,7 +809,7 @@ CSS = """
    COLOUR white or near-black ground, ink, teal lead, claret for urgent, one colour per action
    TYPE Libre Franklin 800 + Libre Franklin
    LAYOUT laptop: strip across, action cards in a grid, pipeline full width; phone: everything stacks */
-:root{color-scheme:light dark;--bg:light-dark(#ffffff,#121417);--ink:light-dark(#17191c,#e9eaec);--mute:light-dark(#5f646b,#9ba1a8);--rule:light-dark(#e4e6e9,#262a2f);--panel:light-dark(#f5f6f7,#1a1d21);--acc:light-dark(#0d7680,#4cb5be);--hot:light-dark(#b0123e,#ff6d8c);--g-review:light-dark(#0e7490,#22d3ee);--g-reply:light-dark(#be123c,#fb7185);--g-fix:light-dark(#c2410c,#fb923c);--g-merge:light-dark(#15803d,#4ade80);--g-new:light-dark(#6d28d9,#a78bfa);--g-release:light-dark(#a16207,#facc15);--g-testing:light-dark(#1d4ed8,#60a5fa);--g-wait:light-dark(#52667a,#9fb3c8)}
+:root{color-scheme:light dark;--bg:light-dark(#ffffff,#121417);--ink:light-dark(#17191c,#e9eaec);--mute:light-dark(#5f646b,#9ba1a8);--rule:light-dark(#e4e6e9,#262a2f);--panel:light-dark(#f5f6f7,#1a1d21);--acc:light-dark(#0d7680,#4cb5be);--hot:light-dark(#b0123e,#ff6d8c);--g-review:light-dark(#0e7490,#22d3ee);--g-reply:light-dark(#be123c,#fb7185);--g-fix:light-dark(#c2410c,#fb923c);--g-merge:light-dark(#15803d,#4ade80);--g-new:light-dark(#6d28d9,#a78bfa);--g-release:light-dark(#a16207,#facc15);--g-testing:light-dark(#1d4ed8,#60a5fa);--g-wait:light-dark(#52667a,#9fb3c8);--g-solo:light-dark(#4d7c0f,#a3e635)}
 *{box-sizing:border-box;min-width:0}
 body{margin:0;background:var(--bg);color:var(--ink);font:15px/1.5 "Libre Franklin",system-ui,sans-serif;overflow-x:clip}
 a{color:inherit;text-decoration:none}
@@ -949,13 +956,12 @@ h3.sub small{font-weight:400;color:var(--mute);font-size:13px;margin-left:10px}
 .tiles.react{grid-template-columns:repeat(4,minmax(0,1fr));max-width:900px}
 @media(max-width:640px){.tiles.react{grid-template-columns:repeat(2,minmax(0,1fr))}.tiles.h5{grid-template-columns:repeat(2,minmax(0,1fr))}.tiles.h5 .tile:nth-child(odd){border-left:0;padding-left:0}}
 .rows li.stale{opacity:.6}
-.g-wait{--c:var(--g-wait)}
+.g-wait{--c:var(--g-wait)}.g-solo{--c:var(--g-solo)}
 .wg{border-bottom:1px solid var(--rule)}
 .wg summary{display:flex;justify-content:space-between;gap:8px;padding:9px 0;cursor:pointer;list-style:none}
 .wg summary::-webkit-details-marker{display:none}
 .wg summary b{font-weight:600}
 .wg summary span{font-size:13px;color:var(--mute);white-space:nowrap}
-.wg.bad summary b{color:var(--hot)}
 .wg[open] summary b::after{content:" ▴";color:var(--mute)}
 .wg:not([open]) summary b::after{content:" ▾";color:var(--mute)}
 .wg li{padding:6px 0 8px 12px}
