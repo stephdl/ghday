@@ -89,14 +89,18 @@ A standup text ready to paste in a chat channel, with a copy button.
 
 ### Stats
 
-- This week and this month against the same point of the previous period,
-  so Monday morning does not look like a drop.
-- PRs merged, reviews done and issues delivered over the last 12 weeks.
-- My median review response time: from a review request to my first review
-  after it.
-- Activity per repository for the month.
+On top, this week and this month side by side, against the same point of the
+previous period, so Monday morning does not look like a drop.
 
-Stats are cached for one hour because they cost most of the API calls.
+Below, two columns on a wide screen. The left one has my median review
+response time, from a review request to my first review after it, then PRs
+merged, reviews done and issues delivered over the last 12 weeks. The right
+one lists my activity per repository for the month. On a narrow screen they
+stack.
+
+Stats are cached for one hour because they cost most of the API calls. The
+cache holds the rendered section, so after updating the script, delete
+`~/.local/state/ghday/stats.json` to see a new layout at once.
 
 ### History
 
