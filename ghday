@@ -106,8 +106,8 @@ query($q: String!, $after: String) {
     issueCount
     pageInfo { hasNextPage endCursor }
     nodes {
-      ... on PullRequest { createdAt mergedAt repository { nameWithOwner } }
-      ... on Issue { createdAt closedAt repository { nameWithOwner } }
+      ... on PullRequest { number title url createdAt mergedAt repository { nameWithOwner } }
+      ... on Issue { number title url createdAt closedAt repository { nameWithOwner } }
     }
   }
 }
@@ -324,7 +324,7 @@ DELIVERED_PAGE = """
 query($q: String!, $after: String) {
   search(type: ISSUE, first: 50, query: $q, after: $after) {
     pageInfo { hasNextPage endCursor }
-    nodes { ... on Issue { number closedAt
+    nodes { ... on Issue { number title url closedAt
       timelineItems(itemTypes: [ASSIGNED_EVENT, UNASSIGNED_EVENT, CROSS_REFERENCED_EVENT], last: 80) {
         nodes {
           __typename
@@ -339,11 +339,11 @@ query($q: String!, $after: String) {
 """
 
 
-def delivered(day, me):
+def delivered(rng, me):
     """Closed QA issues I was assigned to at some point or referenced from one of my PRs."""
     out, after = [], None
     while True:
-        s = graphql(DELIVERED_PAGE, q=f"repo:{QA_REPO} is:issue is:closed reason:completed closed:>={day}", after=after)["search"]
+        s = graphql(DELIVERED_PAGE, q=f"repo:{QA_REPO} is:issue is:closed reason:completed closed:{rng}", after=after)["search"]
         for n in s["nodes"]:
             tl = n["timelineItems"]["nodes"]
             was = any(e["__typename"] in ("AssignedEvent", "UnassignedEvent")
@@ -352,7 +352,8 @@ def delivered(day, me):
                      if e["__typename"] == "CrossReferencedEvent" and e.get("source", {}).get("repository")
                      and (e["source"].get("author") or {}).get("login") == me}
             if was or repos:
-                out.append({"closedAt": n["closedAt"], "repos": sorted(repos)})
+                out.append({"closedAt": n["closedAt"], "repos": sorted(repos), "number": n["number"],
+                            "title": n["title"], "url": n["url"]})
         if not s["pageInfo"]["hasNextPage"]:
             return out
         after = s["pageInfo"]["endCursor"]
@@ -402,7 +403,7 @@ def stats(now):
 
     me = graphql("query { viewer { login } }")["viewer"]["login"]
     with ThreadPoolExecutor(3) as ex:
-        f_closed = ex.submit(delivered, day, me)
+        f_closed = ex.submit(delivered, f">={day}", me)
         f_turn = ex.submit(turnaround, pmonth0.strftime("%Y-%m-%d"), me)
         merged, opened = ex.map(search_all, [f"is:pr author:@me merged:>={day}", f"is:pr author:@me created:>={day}"])
         closed = f_closed.result()
@@ -897,7 +898,15 @@ code{font-size:13px}
 #copy:hover{background:var(--acc)}
 .dgrid{display:grid;grid-template-columns:repeat(auto-fit,minmax(min(100%,340px),1fr));gap:24px 40px}
 .dblock{border-top:2px solid var(--ink);padding-top:10px}
-.dblock h3{margin:0 0 8px;font-size:18px}
+.dblock h3{margin:0 0 8px;font-size:18px;display:flex;justify-content:space-between;gap:8px}.dblock h3 small,.dblock li small{font-weight:400;color:var(--mute);font-size:13px}
+.hhead{display:flex;align-items:center;gap:12px;margin:28px 0 20px}
+.hhead select{font:inherit;font-size:22px;font-weight:800;color:var(--ink);background:var(--panel);border:0;border-radius:999px;padding:6px 14px;cursor:pointer;min-height:44px}
+.hist .bar{cursor:pointer}.hist .bar:hover i{background:var(--acc)}
+h3.sub small{font-weight:400;color:var(--mute);font-size:13px;margin-left:10px}
+.charts.hcharts{grid-template-columns:repeat(auto-fit,minmax(min(100%,300px),1fr))}
+.hhead button{font:inherit;font-size:20px;font-weight:700;border:0;background:var(--panel);color:var(--ink);width:44px;height:44px;border-radius:999px;cursor:pointer}
+.hhead button:disabled{color:var(--mute);opacity:.4;cursor:default}
+.tiles.h5{grid-template-columns:repeat(5,minmax(0,1fr))}
 .dblock li{padding:8px 0;border-bottom:1px solid var(--rule);line-height:1.4}
 .dblock li.none{color:var(--mute)}
 .dblock li a{color:var(--acc);text-decoration:none}.dblock li a:hover{text-decoration:underline}
@@ -919,7 +928,7 @@ code{font-size:13px}
 .follow h5{margin:14px 0 0;font-size:13px;color:var(--mute)}
 .follow h5 span{color:var(--ink)}
 .tiles.react{grid-template-columns:repeat(4,minmax(0,1fr));max-width:900px}
-@media(max-width:640px){.tiles.react{grid-template-columns:repeat(2,minmax(0,1fr))}}
+@media(max-width:640px){.tiles.react{grid-template-columns:repeat(2,minmax(0,1fr))}.tiles.h5{grid-template-columns:repeat(2,minmax(0,1fr))}.tiles.h5 .tile:nth-child(odd){border-left:0;padding-left:0}}
 .rows li.stale{opacity:.6}
 .g-wait{--c:var(--g-wait)}
 .wg{border-bottom:1px solid var(--rule)}
@@ -955,8 +964,12 @@ body{font-size:17px}
 JS = """
 {const bs=[...document.querySelectorAll('nav button')];
 const show=v=>{bs.forEach(b=>b.setAttribute('aria-pressed',b.dataset.v===v));document.querySelectorAll('[data-view]').forEach(s=>s.hidden=s.dataset.view!==v)};
-bs.forEach(b=>b.onclick=()=>{show(b.dataset.v);history.replaceState(null,'','#'+b.dataset.v)});
-show(['stats','daily'].includes(location.hash.slice(1))?location.hash.slice(1):'jour');
+const hv=document.querySelector('[data-view=history]');
+const month=m=>{history.replaceState(null,'','#history'+(m?':'+m:''));hv.innerHTML='<p class="note" style="margin-top:28px">Loading…</p>';
+fetch('/history'+(m?'?m='+m:'')).then(r=>r.text()).then(t=>{hv.innerHTML=t;hv.querySelectorAll('.hhead button,.hist .bar').forEach(b=>b.onclick=()=>month(b.dataset.m));const sel=hv.querySelector('.hhead select');if(sel)sel.onchange=()=>month(sel.value)})};
+bs.forEach(b=>b.onclick=()=>{show(b.dataset.v);if(b.dataset.v==='history'){if(!hv.querySelector('.hist'))month()}else history.replaceState(null,'','#'+b.dataset.v)});
+const h0=location.hash.slice(1),v0=h0.split(':')[0];
+show(['stats','daily','history'].includes(v0)?v0:'jour');if(v0==='history'&&hv)month(h0.split(':')[1]);
 const cp=document.getElementById('copy');
 if(cp)cp.onclick=async()=>{const t=document.getElementById('dtext').value;try{await navigator.clipboard.writeText(t);cp.textContent='Copied'}catch(_){const a=document.getElementById('dtext');a.hidden=false;a.select();document.execCommand('copy');a.hidden=true;cp.textContent='Copied'}setTimeout(()=>cp.textContent='Copy text',2000)};
 const post=(u,b)=>fetch(u,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(b||{})}).then(()=>location.reload());
@@ -981,6 +994,161 @@ def cached_stats(now):
     STATS_CACHE.parent.mkdir(parents=True, exist_ok=True)
     STATS_CACHE.write_text(json.dumps(c))
     return c
+
+
+MONTHS_DIR = STATE.with_name("months")
+HISTORY_MONTHS = 36
+MONTH_LOCK = threading.Lock()
+
+REVIEWS_QUERY = """
+query($from: DateTime!, $to: DateTime!) {
+  viewer { contributionsCollection(from: $from, to: $to) {
+    pullRequestReviewContributions(first: 100) { totalCount nodes {
+      pullRequest { number title url repository { nameWithOwner } } } }
+  } }
+}
+"""
+
+
+def add_month(y, m, k):
+    i = y * 12 + m - 1 + k
+    return i // 12, i % 12 + 1
+
+
+def month_bounds(y, m):
+    ny, nm = add_month(y, m, 1)
+    return datetime(y, m, 1).astimezone(), datetime(ny, nm, 1).astimezone()
+
+
+def day_range(a, b):
+    return f"{a:%Y-%m-%d}..{b - timedelta(days=1):%Y-%m-%d}"
+
+
+def month_report(y, m, now):
+    a, b = month_bounds(y, m)
+    rng = day_range(a, b)
+    me = graphql("query { viewer { login } }")["viewer"]["login"]
+    trend = [add_month(y, m, k) for k in range(-11, 1)]
+    searches, contribs = [], []
+    for i, (ty, tm) in enumerate(trend):
+        ta, tb = month_bounds(ty, tm)
+        searches.append(f's{i}: search(type: ISSUE, first: 1, query: "is:pr author:@me merged:{day_range(ta, tb)}") {{ issueCount }}')
+        contribs.append(f'c{i}: contributionsCollection(from: "{iso(ta)}", to: "{iso(min(tb, now))}") '
+                        f'{{ totalPullRequestReviewContributions }}')
+    with ThreadPoolExecutor(4) as ex:
+        f_merged = ex.submit(search_all, f"is:pr author:@me merged:{rng}")
+        f_opened = ex.submit(search_all, f"is:pr author:@me created:{rng}")
+        f_closed = ex.submit(delivered, rng, me)
+        f_turn = ex.submit(turnaround, f"{a:%Y-%m-%d}", me)
+        f_rev = ex.submit(lambda: graphql(REVIEWS_QUERY, **{"from": iso(a), "to": iso(min(b, now))}))
+        f_trend = ex.submit(graphql, "query { " + " ".join(searches) + " viewer { " + " ".join(contribs) + " } }")
+        merged, opened, closed = f_merged.result(), f_opened.result(), f_closed.result()
+        turn, rev, tr = f_turn.result(), f_rev.result(), f_trend.result()
+
+    reviews = {}
+    rc = rev["viewer"]["contributionsCollection"]["pullRequestReviewContributions"]
+    for n in rc["nodes"]:
+        pr = n["pullRequest"]
+        r = reviews.setdefault(pr["url"], {"number": pr["number"], "title": pr["title"], "url": pr["url"],
+                                           "repo": pr["repository"]["nameWithOwner"], "n": 0})
+        r["n"] += 1
+    vals = [h for d, h in turn if a <= d < b]
+    return {"merged": [{"number": n["number"], "title": n["title"], "url": n["url"],
+                        "repo": n["repository"]["nameWithOwner"]} for n in merged],
+            "opened": len(opened), "closed": closed, "reviews": list(reviews.values()),
+            "review_total": rc["totalCount"],
+            "react": [statistics.median(vals) if vals else None, len(vals)],
+            "trend": [{"y": ty, "m": tm, "merged": tr[f"s{i}"]["issueCount"],
+                       "reviews": tr["viewer"][f"c{i}"]["totalPullRequestReviewContributions"]}
+                      for i, (ty, tm) in enumerate(trend)]}
+
+
+def cached_month(y, m, now):
+    path = MONTHS_DIR / f"{y:04d}-{m:02d}.json"
+    with MONTH_LOCK:
+        try:
+            c = json.loads(path.read_text())
+            # A closed month no longer changes on GitHub, so its copy is kept for good.
+            if c["closed"] or now - ts(c["at"]) < STATS_TTL:
+                return c["report"], ts(c["at"])
+        except (OSError, ValueError, KeyError):
+            pass
+        r = month_report(y, m, now)
+        # The hour of margin lets the search index catch up with the last day of the month.
+        closed = now >= month_bounds(y, m)[1] + timedelta(hours=1)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps({"at": iso(now), "closed": closed, "report": r}))
+        return r, now
+
+
+def render_history(r, y, m, at, now):
+    local = now.astimezone()
+    py, pm = add_month(y, m, -1)
+    ny, nm = add_month(y, m, 1)
+    later = (ny, nm) <= (local.year, local.month)
+    name, pname = f"{MONTHS[m - 1]} {y}", MONTHS[pm - 1]
+    prev = r["trend"][-2]
+    merged, closed, reviews = r["merged"], r["closed"], r["reviews"]
+
+    def tile_h(label, cur, before, sub=None):
+        sub = sub or (f"{pname}: {before}" if before is not None else "")
+        return (f'<div class="tile"><span class="tl">{label}</span><div class="tv"><b>{cur}</b>'
+                f'{trend(cur, before) if before is not None else ""}</div><span class="tp">{sub}</span></div>')
+    med, nreq = r["react"]
+    tiles = (tile_h("PRs merged", len(merged), prev["merged"]) + tile_h("PRs opened", r["opened"], None)
+             + tile_h("Reviews done", r["review_total"], prev["reviews"])
+             + tile_h("Issues delivered", len(closed), None)
+             + tile_h("Review response", dur(med), None, f'median of {nreq} request{"s" if nreq != 1 else ""}'))
+
+    charts = []
+    for key, label in (("merged", "PRs merged"), ("reviews", "Reviews done")):
+        vals = [x[key] for x in r["trend"]]
+        top = max(vals) or 1
+        bars = "".join(
+            f'<div class="bar{" cur" if i == len(vals) - 1 else ""}" data-m="{x["y"]:04d}-{x["m"]:02d}" title="{MONTHS[x["m"] - 1]} {x["y"]}: {v}">'
+            f'<span>{v or ""}</span><i style="height:{v / top * 100:.1f}%"></i></div>'
+            for i, (x, v) in enumerate(zip(r["trend"], vals)))
+        first = r["trend"][0]
+        charts.append(f'<div class="chart"><h4>{label}</h4><div class="bars">{bars}</div>'
+                      f'<div class="axis"><span>{MONTHS[first["m"] - 1][:3]} {first["y"]}</span><span>{name}</span></div></div>')
+
+    def block(title, items, empty):
+        lis = "".join(items) or f'<li class="none">{empty}</li>'
+        return f'<section class="dblock"><h3>{title}<small>{len(items)}</small></h3><ul>{lis}</ul></section>'
+
+    def ref(x, repo):
+        return f'<a href="{e(x["url"])}">{e(short_repo(repo))}#{x["number"]}</a> {e(x["title"])}'
+    li_m = [f"<li>{ref(x, x['repo'])}</li>" for x in sorted(merged, key=lambda x: (x["repo"], x["number"]))]
+    li_c, li_r = [], []
+    for x in sorted(closed, key=lambda x: x["closedAt"]):
+        via = " <small>" + e(", ".join(short_repo(p) for p in x["repos"])) + "</small>" if x["repos"] else ""
+        li_c.append(f"<li>{ref(x, QA_REPO)}{via}</li>")
+    for x in sorted(reviews, key=lambda x: (x["repo"], x["number"])):
+        times = f' <small>{x["n"]} reviews</small>' if x["n"] > 1 else ""
+        li_r.append(f'<li>{ref(x, x["repo"])}{times}</li>')
+    listed = sum(x["n"] for x in reviews)
+    more = f'<p class="note">{listed} of {r["review_total"]} reviews listed, GitHub returns 100 at most.</p>' \
+        if r["review_total"] > listed else ""
+    kept = "Kept for good, GitHub is no longer asked." if local >= month_bounds(y, m)[1] + timedelta(hours=1) \
+        else "Month in progress, computed at most once per hour."
+    # Months already on disk open at once, the others cost a GitHub round trip.
+    have = {f.stem for f in MONTHS_DIR.glob("*.json")}
+    opts = []
+    for k in range(HISTORY_MONTHS):
+        oy, om = add_month(local.year, local.month, -k)
+        key = f"{oy:04d}-{om:02d}"
+        opts.append(f'<option value="{key}"{" selected" if (oy, om) == (y, m) else ""}>'
+                    f'{MONTHS[om - 1]} {oy}{" ✓" if key in have else ""}</option>')
+    return (f'<div class="hist" data-m="{y:04d}-{m:02d}"><div class="hhead">'
+            f'<button type="button" data-m="{py:04d}-{pm:02d}" aria-label="Previous month">‹</button>'
+            f'<select aria-label="Month">{"".join(opts)}</select>'
+            f'<button type="button" data-m="{ny:04d}-{nm:02d}" aria-label="Next month"{"" if later else " disabled"}>›</button></div>'
+            f'<div class="tiles h5">{tiles}</div>'
+            f'<h3 class="sub">Last 12 months<small>click a bar to open its month</small></h3><div class="charts hcharts">{"".join(charts)}</div>'
+            f'<h3 class="sub">What was done</h3><div class="dgrid">'
+            f'{block("PRs merged", li_m, "none")}{block("Issues delivered", li_c, "none")}'
+            f'{block("Reviews done", li_r, "none")}</div>{more}'
+            f'<p class="note" style="margin-top:24px">Computed {at.astimezone():%b %d, %H:%M}. {kept}</p></div>')
 
 
 DAILY_QUERY = """
@@ -1178,7 +1346,7 @@ def render(f, since, live=False, every=REFRESH):
 <link rel="preconnect" href="https://fonts.googleapis.com"><link href="https://fonts.googleapis.com/css2?family=Libre+Franklin:wght@400;500;600;700;800&display=swap" rel="stylesheet">
 <style>{CSS}</style></head><body data-live="{1 if live else 0}" data-every="{every}"><div class="wrap">
 <div class="top"><div><h1>{DAYS[local.weekday()]}, {MONTHS[local.month - 1]} {local.day}</h1><p class="lede">{lede}</p></div>
-<div class="tr-r">{refresh_select(every) if live else ""}<nav><button data-v="jour" aria-pressed="true">Today</button><button data-v="daily" aria-pressed="false">Daily</button><button data-v="stats" aria-pressed="false">Stats</button></nav></div></div>
+<div class="tr-r">{refresh_select(every) if live else ""}<nav><button data-v="jour" aria-pressed="true">Today</button><button data-v="daily" aria-pressed="false">Daily</button><button data-v="stats" aria-pressed="false">Stats</button>{'<button data-v="history" aria-pressed="false">History</button>' if live else ""}</nav></div></div>
 <main data-view="jour">
 {render_strip(groups)}
 <div class="board"><div class="main-col">
@@ -1192,6 +1360,7 @@ def render(f, since, live=False, every=REFRESH):
 </main>
 <main data-view="daily" hidden>{render_daily(dt)}</main>
 <main data-view="stats" hidden>{st["html"]}<p class="note" style="margin-top:24px">Computed {ago(ts(st["at"]), now)} ago, at most once per hour.</p></main>
+{'<main data-view="history" hidden></main>' if live else ""}
 <footer>{foot} Account {e(me)}, through <code>gh</code>.</footer>
 </div><script>{JS}</script></body></html>"""
 
@@ -1300,6 +1469,9 @@ def serve(port):
 
     class H(BaseHTTPRequestHandler):
         def do_GET(self):
+            if self.path.startswith("/history"):
+                self.history()
+                return
             if self.path not in ("/", "/index.html"):
                 self.send_error(404)
                 return
@@ -1317,6 +1489,24 @@ def serve(port):
             self.send_header("Cache-Control", "no-store")
             self.end_headers()
             self.wfile.write(body)
+
+        def history(self):
+            now = datetime.now(timezone.utc)
+            local = now.astimezone()
+            y, m = add_month(local.year, local.month, -1)
+            q = re.search(r"[?&]m=(\d{4})-(\d{2})\b", self.path)
+            if q and 1 <= int(q[2]) <= 12 and (int(q[1]), int(q[2])) <= (local.year, local.month):
+                y, m = int(q[1]), int(q[2])
+            try:
+                r, at = cached_month(y, m, now)
+                body, code = render_history(r, y, m, at, now), 200
+            except Exception as ex:  # show the error in the tab instead of a blank page
+                body, code = f'<p class="note" style="margin-top:28px">History failed: {e(str(ex))}</p>', 500
+            self.send_response(code)
+            self.send_header("Content-Type", "text/html; charset=utf-8")
+            self.send_header("Cache-Control", "no-store")
+            self.end_headers()
+            self.wfile.write(body.encode())
 
         def do_POST(self):
             try:

@@ -98,6 +98,21 @@ A standup text ready to paste in a chat channel, with a copy button.
 
 Stats are cached for one hour because they cost most of the API calls.
 
+### History
+
+Server mode only. One month at a time, with arrows to go back. It opens on
+the previous month.
+
+- PRs merged, PRs opened, reviews done, issues delivered and my median review
+  response time, against the month before.
+- PRs merged and reviews done over the 12 months up to that one.
+- The lists behind the numbers: PRs merged by repository, issues delivered
+  with the repositories of my PRs, PRs I reviewed.
+
+A month is loaded only when I open it. A closed month no longer changes on
+GitHub, so it is computed once and kept on disk for good. The current month
+follows the same one hour rule as Stats. To recompute a month, delete its file.
+
 ## The QA flow
 
 The script follows the NethServer way of working in `NethServer/dev`. A
@@ -132,6 +147,7 @@ GitHub API calls made by `gh`.
 | `~/.local/state/ghday/stats.json` | Stats cache (1 hour) |
 | `~/.local/state/ghday/notified.json` | Items already notified |
 | `~/.local/state/ghday/hidden.json` | Hidden and snoozed items |
+| `~/.local/state/ghday/months/YYYY-MM.json` | History, one file per month |
 | `~/.local/share/ghday/index.html` | Page built by `ghday` and `ghday build` |
 
 ## Limits
