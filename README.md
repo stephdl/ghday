@@ -18,6 +18,26 @@ the `gh` login I already have.
 - `notify-send` for desktop notifications (optional)
 - systemd user session to run it as a service (optional)
 
+### Token scopes
+
+ghday only reads from GitHub. It needs a classic token with these scopes:
+
+| Scope | What it gives | Without it |
+|---|---|---|
+| `repo` | Issues and PRs of private repositories, and the notifications | Only public repositories show, and private contributions are not counted |
+| `read:org` | Review requests sent to a team | Team review requests may be missing |
+| `read:project` | The Status column of Projects v2 | The status badge is missing, the rest works |
+
+A default `gh auth login` gives `repo` and `read:org`. Add the last one with:
+
+```sh
+gh auth refresh -s read:project
+```
+
+`repo` also allows writing, because classic tokens have no read only scope for
+private repositories. Fine-grained tokens do not work: the notifications API
+refuses them, and they are limited to one owner.
+
 ## Install
 
 ```sh
