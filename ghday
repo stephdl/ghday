@@ -740,7 +740,7 @@ def render_stats(s):
                    + tile("Reviews done", cur["reviews"], None, full["reviews"], pname)
                    + tile("Issues delivered", cur["closed"], prev["closed"], full["closed"], pname)
                    + "</div></div>")
-    out.append(f'</div>{render_react(s)}<p class="note" style="margin-top:12px">Issues delivered: {QA_REPO} issues closed as completed, '
+    out.append(f'</div><div class="stats-grid"><section>{render_react(s)}<p class="note" style="margin-top:12px">Issues delivered: {QA_REPO} issues closed as completed, '
                f'that you were assigned to at some point or that one of your PRs references.</p>')
 
     charts = []
@@ -755,7 +755,7 @@ def render_stats(s):
         avg_line = f'<div class="avg" style="bottom:{avg / top * 100:.1f}%"></div>' if avg else ""
         charts.append(f'<div class="chart"><h4>{name}<small>- - moyenne {avg:.1f} / sem.</small></h4><div class="bars">{bars}{avg_line}</div>'
                       f'<div class="axis"><span>week of {s["series"][0]["week"]:%b %d}</span><span>this week</span></div></div>')
-    out.append(f'<div class="stats-grid"><section><h3 class="sub">Last {WEEKS} weeks</h3><div class="charts">' + "".join(charts) + "</div></section>")
+    out.append(f'<h3 class="sub">Last {WEEKS} weeks</h3><div class="charts">' + "".join(charts) + "</div></section>")
 
     if s["repos"]:
         top_m = max(c["merged"] for _, c in s["repos"]) or 1
