@@ -20,7 +20,8 @@ the `gh` login I already have.
 
 ### Token scopes
 
-ghday only reads from GitHub. It needs a classic token with these scopes:
+ghday reads from GitHub. The only write is the "Mark all read" button, which
+marks notifications read. It needs a classic token with these scopes:
 
 | Scope | What it gives | Without it |
 |---|---|---|
