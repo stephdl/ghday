@@ -45,8 +45,9 @@ fragment I on Issue {
   timelineItems(itemTypes: [ASSIGNED_EVENT], last: 10) {
     nodes { ... on AssignedEvent { createdAt assignee { ... on User { login } } } }
   }
-  refs: timelineItems(itemTypes: [CROSS_REFERENCED_EVENT], last: 20) {
-    nodes { ... on CrossReferencedEvent { source { ... on PullRequest { author { login } state } } } }
+  refs: timelineItems(itemTypes: [CROSS_REFERENCED_EVENT, CONNECTED_EVENT], last: 40) {
+    nodes { ... on CrossReferencedEvent { source { ... on PullRequest { url author { login } state } } }
+            ... on ConnectedEvent { subject { ... on PullRequest { url author { login } state } } } }
   }
 }
 fragment P on PullRequest {
@@ -255,9 +256,7 @@ def analyse(data, me, since, now):
         other, mine_t = other_activity(iss, me)
         iss["_other"] = other
         # An open or merged PR of mine on the issue means the work has already started.
-        started = any((n.get("source") or {}).get("state") in ("OPEN", "MERGED")
-                      and ((n["source"].get("author") or {}).get("login")) == me
-                      for n in iss["refs"]["nodes"] if n)
+        started = bool(live_prs(iss, me)[0])
         if iss["_assigned"] and now - iss["_assigned"] < timedelta(days=3) and not started:
             add("new", iss, "assigned to you", iss["_assigned"])
         if other and mine_t and other[0] > mine_t:
@@ -617,7 +616,23 @@ def slug(name):
     return re.sub(r"[^a-z]+", "-", name.lower()).strip("-")
 
 
-def render_issues(issues, since, now):
+def live_prs(iss, me):
+    """Open or merged PRs linked to the issue, as (mine, others) sets of URLs."""
+    mine, others = set(), set()
+    for n in (iss.get("refs") or {}).get("nodes", []):
+        # A PR that mentions the issue is a source, one linked from the Development box is a subject.
+        pr = (n or {}).get("source") or (n or {}).get("subject") or {}
+        if pr.get("state") in ("OPEN", "MERGED"):
+            ((mine if (pr.get("author") or {}).get("login") == me else others)).add(pr["url"])
+    return mine, others
+
+
+def nopr_note(issues, me):
+    n = sum(1 for it in issues if not live_prs(it, me)[0])
+    return f", {n} without a PR from you" if n else ""
+
+
+def render_issues(issues, me, since, now):
     if not issues:
         return '<p class="calm">No issue assigned.</p>'
 
@@ -642,8 +657,11 @@ def render_issues(issues, since, now):
         ms = f'<span class="ms">{e(it["milestone"]["title"])}</span>' if it.get("milestone") else ""
         stale = now - ts(it["updatedAt"]) > timedelta(days=STALE_DAYS)
         quiet = f'<span class="flag">quiet {ago(ts(it["updatedAt"]), now)}</span>' if stale else ""
+        mine, others = live_prs(it, me)
+        nopr = "" if mine else \
+            f'<span class="flag nopr">no PR{f" · {len(others)} by others" if others else ""}</span>'
         return (f'<li{" class=stale" if stale else ""}><a class="t" href="{e(it["url"])}">{e(it["title"])}</a>'
-                f'<div class="m">{ref(it)}{labs}{ms}{quiet}<span class="age">assigned {ago(arrived(it), now)} ago</span></div></li>')
+                f'<div class="m">{ref(it)}{labs}{ms}{nopr}{quiet}<span class="age">assigned {ago(arrived(it), now)} ago</span></div></li>')
 
     return f'<ul class="rows">{"".join(row(x) for x in sorted(issues, key=arrived, reverse=True))}</ul>'
 
@@ -835,6 +853,7 @@ li.new .t::before{content:"";display:inline-block;width:8px;height:8px;border-ra
 
 .fl{display:flex;gap:6px;flex-wrap:wrap}
 .flag{font-size:12px;font-weight:600;padding:1px 7px;border-radius:4px;background:var(--panel);color:var(--mute)}
+.flag.nopr{color:var(--g-fix);background:color-mix(in srgb,var(--g-fix) 14%,transparent)}
 .flag.bad{background:color-mix(in srgb,var(--hot) 14%,transparent);color:var(--hot)}
 .none{margin:0;font-size:13px;color:var(--mute)}
 .bucket{margin-top:18px}
@@ -1353,8 +1372,8 @@ def render(f, since, live=False, every=REFRESH):
 <div class="board"><div class="main-col">
 {render_groups(groups, now, live, hidden, render_waiting(mine, my_move(groups), data["mine"]["issueCount"], now))}
 </div><aside class="side-col">
-<h2>My issues</h2><p class="h2note">{data["assigned"]["issueCount"]} assigned, newest first.</p>
-{render_issues(data["assigned"]["nodes"], since, now)}
+<h2>My issues</h2><p class="h2note">{data["assigned"]["issueCount"]} assigned{nopr_note(data["assigned"]["nodes"], me)}, newest first.</p>
+{render_issues(data["assigned"]["nodes"], me, since, now)}
 {render_follow(data, shown, now)}
 {render_notes(notes, shown, now)}
 </aside></div>
