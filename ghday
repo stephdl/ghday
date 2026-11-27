@@ -977,7 +977,8 @@ document.querySelectorAll('.act button').forEach(b=>b.onclick=ev=>{ev.preventDef
 const ev=document.getElementById('every');if(ev)ev.onchange=()=>post('/refresh-every',{s:+ev.value});
 const nw=document.getElementById('now');if(nw)nw.onclick=()=>{nw.disabled=true;nw.textContent='Refreshing…';post('/refresh-now')};
 const uh=document.getElementById('unhide');if(uh)uh.onclick=()=>post('/unhide-all');
-if(document.body.dataset.live==='1'){const t0=Date.now();const tick=()=>{if(document.visibilityState==='visible'&&Date.now()-t0>document.body.dataset.every*1000&&!document.querySelector('details[open]'))location.reload()};setInterval(tick,30000);document.addEventListener('visibilitychange',tick)}}
+const ds=[...document.querySelectorAll('details')];try{JSON.parse(sessionStorage.getItem('open')||'[]').forEach(i=>{if(ds[i])ds[i].open=true});sessionStorage.removeItem('open')}catch(_){}
+if(document.body.dataset.live==='1'){const tick=()=>{if(document.visibilityState!=='visible')return;fetch('/at').then(r=>r.text()).then(at=>{if(at&&at!==document.body.dataset.at){try{sessionStorage.setItem('open',JSON.stringify(ds.flatMap((d,i)=>d.open?[i]:[])))}catch(_){}location.reload()}}).catch(()=>{})};setInterval(tick,15000);document.addEventListener('visibilitychange',tick)}}
 """
 
 
@@ -1344,7 +1345,7 @@ def render(f, since, live=False, every=REFRESH):
     return f"""<!doctype html><html lang="en"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1"><title>GitHub day</title><link rel="icon" href="data:image/svg+xml,{FAVICON}">
 <link rel="preconnect" href="https://fonts.googleapis.com"><link href="https://fonts.googleapis.com/css2?family=Libre+Franklin:wght@400;500;600;700;800&display=swap" rel="stylesheet">
-<style>{CSS}</style></head><body data-live="{1 if live else 0}" data-every="{every}"><div class="wrap">
+<style>{CSS}</style></head><body data-live="{1 if live else 0}" data-every="{every}" data-at="{iso(f["at"])}"><div class="wrap">
 <div class="top"><div><h1>{DAYS[local.weekday()]}, {MONTHS[local.month - 1]} {local.day}</h1><p class="lede">{lede}</p></div>
 <div class="tr-r">{refresh_select(every) if live else ""}<nav><button data-v="jour" aria-pressed="true">Today</button><button data-v="daily" aria-pressed="false">Daily</button><button data-v="stats" aria-pressed="false">Stats</button>{'<button data-v="history" aria-pressed="false">History</button>' if live else ""}</nav></div></div>
 <main data-view="jour">
@@ -1469,6 +1470,17 @@ def serve(port):
 
     class H(BaseHTTPRequestHandler):
         def do_GET(self):
+            if self.path == "/at":
+                # The page polls this to reload as soon as the server has new data.
+                with lock:
+                    f = cache["f"]
+                body = (iso(f["at"]) if f else "").encode()
+                self.send_response(200)
+                self.send_header("Content-Type", "text/plain")
+                self.send_header("Cache-Control", "no-store")
+                self.end_headers()
+                self.wfile.write(body)
+                return
             if self.path.startswith("/history"):
                 self.history()
                 return
