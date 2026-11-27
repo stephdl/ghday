@@ -316,8 +316,22 @@ def notifications():
         out.append({"id": n["id"], "reason": n["reason"], "title": n["subject"]["title"],
                     "repo": n["repository"]["full_name"], "url": url or n["repository"]["html_url"],
                     "when": ts(n["updated_at"])})
-    return out
+    return thread_states(out)
 
+
+def thread_states(notes):
+    """Add the open or closed state of each issue or PR thread, in one GraphQL call."""
+    urls = sorted({n["url"] for n in notes if re.search(r"/(issues|pull)/\d+$", n["url"])})
+    if not urls:
+        return notes
+    fields = " ".join(f'n{i}: resource(url: {json.dumps(u)}) {{ ... on Issue {{ state }} ... on PullRequest {{ state }} }}'
+                      for i, u in enumerate(urls))
+    try:
+        data = graphql(f"query {{ {fields} }}")
+    except RuntimeError:
+        return notes
+    state = {u: (data.get(f"n{i}") or {}).get("state") for i, u in enumerate(urls)}
+    return [{**n, "state": state.get(n["url"])} for n in notes]
 
 
 def mark_read(ids):
@@ -685,8 +699,18 @@ def render_issues(issues, me, since, now):
     return f'<ul class="rows">{"".join(row(x) for x in sorted(issues, key=arrived, reverse=True))}</ul>'
 
 
+def listed(data, shown):
+    return set(shown) | {i["url"] for i in data["assigned"]["nodes"]} | {i["url"] for i in data["_testing"]}
+
+
+def on_page(data, shown):
+    """URLs of every issue and PR the Today view already shows, follow list and my open PRs included."""
+    return (listed(data, shown) | {p["url"] for p in data["mine"]["nodes"]}
+            | {it["url"] for nodes in (data["created"]["nodes"], data["mentioned"]["nodes"]) for it in nodes})
+
+
 def render_follow(data, shown, now):
-    seen = set(shown) | {i["url"] for i in data["assigned"]["nodes"]} | {i["url"] for i in data["_testing"]}
+    seen = listed(data, shown)
     items = {}
     for kind, nodes in (("opened by you", data["created"]["nodes"]), ("mentions you", data["mentioned"]["nodes"])):
         for it in nodes:
@@ -712,9 +736,10 @@ def render_follow(data, shown, now):
             f'<small>{recent} active this week</small></summary>{"".join(blocks)}</details>')
 
 
-def render_notes(notes, shown, now, live=False):
-    keep = [n for n in notes if n["url"] not in shown
-            and n["reason"] in ("mention", "team_mention", "comment", "author", "state_change", "assign")]
+def render_notes(notes, seen, now, live=False):
+    # Assign, author and state changes are already covered by the cards, only talk aimed at me is left.
+    keep = [n for n in notes if n["url"] not in seen and n.get("state") not in ("CLOSED", "MERGED")
+            and n["reason"] in ("mention", "team_mention", "comment")]
     if not keep:
         return ""
     rows = "".join(f'<li><a class="t" href="{e(n["url"])}">{e(n["title"])}</a><div class="m">'
@@ -723,7 +748,7 @@ def render_notes(notes, shown, now, live=False):
     clean = (f'<button type="button" id="clean" data-ids="{e(",".join(n["id"] for n in keep))}">Mark all read</button>'
              if live else "")
     return (f'<section class="card g-notes" id="g-notes"><header><h3>Unread notifications</h3><span class="n">{len(keep)}</span></header>'
-            f'<p class="hint">unread on GitHub and not in a card above{", mark them read here once seen" if live else ""}</p>'
+            f'<p class="hint">open threads where someone wrote to you, not listed elsewhere on the page{", mark them read here once seen" if live else ""}</p>'
             f'<ul>{rows}</ul>{clean}</section>')
 
 
@@ -1393,7 +1418,7 @@ def render(f, since, live=False, every=REFRESH):
 <main data-view="jour">
 {render_strip(groups)}
 <div class="board"><div class="main-col">
-{render_groups(groups, now, live, hidden, render_waiting(mine, my_move(groups), data["mine"]["issueCount"], now) + render_notes(notes, shown, now, live))}
+{render_groups(groups, now, live, hidden, render_waiting(mine, my_move(groups), data["mine"]["issueCount"], now) + render_notes(notes, on_page(data, shown), now, live))}
 </div><aside class="side-col">
 <h2>My issues</h2><p class="h2note">{data["assigned"]["issueCount"]} assigned{nopr_note(data["assigned"]["nodes"], me)}, newest first.</p>
 {render_issues(data["assigned"]["nodes"], me, since, now)}
